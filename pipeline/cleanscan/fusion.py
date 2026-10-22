@@ -28,7 +28,7 @@ class FusionConfig:
     sdf_trunc_voxels: float = 4.0
     min_depth: float = 0.15
     max_depth: float = 5.0  # LiDAR/ToF quality drops quickly past ~5 m
-    min_confidence: float = 0.5  # 0..1 (ARKit: medium+high)
+    min_confidence: float | None = None  # 0..1; None = session's recommendation or 0.5
     mask_dilate_px: int = 4
     edge_threshold: float = 0.04  # relative depth jump that marks a "flying pixel"
     min_weight: float = 2.0  # a surface must be seen in >= 2 frames to be kept
@@ -67,7 +67,7 @@ def prepare_depth(session: Session, frame: Frame, cfg: FusionConfig,
     depth = session.load_depth(frame)
     conf = session.load_confidence(frame)
     if conf is not None:
-        depth[conf < cfg.min_confidence - 1e-6] = 0
+        depth[conf < (0.5 if cfg.min_confidence is None else cfg.min_confidence) - 1e-6] = 0
     depth[(depth < cfg.min_depth) | (depth > cfg.max_depth)] = 0
     depth = remove_flying_pixels(depth, cfg.edge_threshold)
 

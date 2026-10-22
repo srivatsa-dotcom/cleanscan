@@ -37,7 +37,8 @@ def main(argv=None) -> int:
     p.add_argument("--name", default=None, help="Gazebo model name (default: folder name)")
     p.add_argument("--voxel", type=float, default=0.02, help="TSDF voxel size in m (0.01 = finer, slower)")
     p.add_argument("--max-depth", type=float, default=5.0)
-    p.add_argument("--min-confidence", type=float, default=0.5)
+    p.add_argument("--min-confidence", type=float, default=None,
+                   help="0..1 depth confidence cut-off (default: the value recommended by the app, else 0.5)")
     p.add_argument("--mask-dilate", type=int, default=4, help="grow people/animal masks by N depth px")
     p.add_argument("--no-ghost-removal", action="store_true")
     p.add_argument("--resegment", metavar="MODEL", default=None,

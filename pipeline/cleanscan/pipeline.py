@@ -61,6 +61,9 @@ def run(session_dir: str | Path, out_dir: str | Path, cfg: PipelineConfig) -> di
     log.info("loaded %d frames from %s (%s)", len(session.frames), session_dir,
              session.meta.get("platform", "?"))
 
+    if cfg.fusion.min_confidence is None:
+        cfg.fusion.min_confidence = float(session.meta.get("recommended_min_confidence", 0.5))
+
     masks = resegment_session(session, cfg.resegment_model) if cfg.resegment_model else None
 
     log.info("pass 1: fusing with people/animal masks")

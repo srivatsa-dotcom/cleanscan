@@ -18,6 +18,8 @@ moments of the scan. The result is exported as a ready-to-run **Gazebo world** p
                                               └─────────────────────────────────────────┘
 ```
 
+![Synthetic test: a person walks in front of the wall; the exported mesh has the wall rebuilt behind them](docs/demo_before_after.png)
+
 ## How living beings are removed
 
 Removal works in three layers, so that something missed by one layer is caught by the next:

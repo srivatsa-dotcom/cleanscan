@@ -1,0 +1,12 @@
+__pycache__/
+*.egg-info/
+.pytest_cache/
+*.mlpackage/
+*.mlmodelc/
+*.tflite
+*.pt
+ios/*.xcodeproj/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cleanscan"
+version = "0.1.0"
+description = "Turn CleanScan phone captures into people/animal-free meshes, Gazebo worlds and nav maps"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "open3d>=0.18",
+    "opencv-python-headless>=4.8",
+]
+
+[project.optional-dependencies]
+# Stronger desktop re-segmentation of people/animals (YOLO-seg).
+seg = ["ultralytics>=8.1"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+cleanscan = "cleanscan.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["cleanscan*"]

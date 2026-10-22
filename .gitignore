@@ -1,12 +1,14 @@
 __pycache__/
 *.egg-info/
 .pytest_cache/
-*.mlpackage/
 *.mlmodelc/
-*.tflite
 *.pt
+# exported app models ARE committed (ios/Models, android/app/src/main/assets)
 ios/*.xcodeproj/
 android/.gradle/
 android/build/
 android/app/build/
 android/local.properties
+tools/decoder-test/build/
+tools/decoder-test/.gradle/
+.kotlin/

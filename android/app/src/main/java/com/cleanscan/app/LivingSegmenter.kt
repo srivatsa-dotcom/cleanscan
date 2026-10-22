@@ -32,25 +32,20 @@ class LivingSegmenter(context: Context) {
      * @return mask (0 / 255) at depth resolution, depth image is also sensor-oriented
      */
     fun segment(sensorImage: Bitmap, depthW: Int, depthH: Int): ByteArray {
-        val out = ByteArray(depthW * depthH)
-        val tfl = interpreter ?: return out
-        val inShape = tfl.getInputTensor(0).shape()  // [1, H, W, 3]
-        val inH = inShape[1]
-        val inW = inShape[2]
+        val mask = ByteArray(depthW * depthH)
+        val tfl = interpreter ?: return mask
+        // Input is [1, 3, H, W] (LiteRT export) or [1, H, W, 3] (older TF exports).
+        val layout = YoloSegDecoder.InputLayout.of(tfl.getInputTensor(0).shape())
 
         // Phone is held in portrait: rotate so people are upright for the detector.
         val upright = Bitmap.createBitmap(sensorImage, 0, 0, sensorImage.width, sensorImage.height,
             Matrix().apply { postRotate(90f) }, true)
-        val scaled = Bitmap.createScaledBitmap(upright, inW, inH, true)
-        val input = ByteBuffer.allocateDirect(4 * inW * inH * 3).order(ByteOrder.nativeOrder())
-        val px = IntArray(inW * inH)
-        scaled.getPixels(px, 0, inW, 0, 0, inW, inH)
-        for (p in px) {
-            input.putFloat(((p shr 16) and 0xFF) / 255f)
-            input.putFloat(((p shr 8) and 0xFF) / 255f)
-            input.putFloat((p and 0xFF) / 255f)
-        }
-        input.rewind()
+        val scaled = Bitmap.createScaledBitmap(upright, layout.width, layout.height, true)
+        val px = IntArray(layout.width * layout.height)
+        scaled.getPixels(px, 0, layout.width, 0, 0, layout.width, layout.height)
+        val packed = YoloSegDecoder.packInput(px, layout)
+        val input = ByteBuffer.allocateDirect(4 * packed.size).order(ByteOrder.nativeOrder())
+        input.asFloatBuffer().put(packed)
 
         // Identify outputs by rank: detections are 3-D, prototypes 4-D.
         var detIdx = 0
@@ -65,31 +60,14 @@ class LivingSegmenter(context: Context) {
         tfl.runForMultipleInputsOutputs(arrayOf(input), mapOf(detIdx to detBuf, protoIdx to protoBuf))
         detBuf.rewind()
         protoBuf.rewind()
+        val rawDet = FloatArray(detBuf.capacity() / 4).also { detBuf.asFloatBuffer().get(it) }
+        val rawProto = FloatArray(protoBuf.capacity() / 4).also { protoBuf.asFloatBuffer().get(it) }
 
-        // TFLite prototypes are NHWC [1, mh, mw, nm]; transpose to [nm, mh, mw].
-        val channelsLast = pShape[3] < pShape[1]
-        val nm = if (channelsLast) pShape[3] else pShape[1]
-        val mh = if (channelsLast) pShape[1] else pShape[2]
-        val mw = if (channelsLast) pShape[2] else pShape[3]
-        val rawProto = FloatArray(nm * mh * mw).also { protoBuf.asFloatBuffer().get(it) }
-        val proto = if (!channelsLast) rawProto else FloatArray(rawProto.size).also { t ->
-            for (y in 0 until mh) for (x in 0 until mw) for (k in 0 until nm)
-                t[k * mh * mw + y * mw + x] = rawProto[(y * mw + x) * nm + k]
-        }
-
-        // detections may be [1, C, N] or [1, N, C]
-        var c = dShape[1]
-        var n = dShape[2]
-        var det = FloatArray(c * n).also { detBuf.asFloatBuffer().get(it) }
-        if (c > n) {
-            val t = FloatArray(det.size)
-            for (i in 0 until c) for (j in 0 until n) t[j * c + i] = det[i * n + j]
-            det = t
-            c = dShape[2]; n = dShape[1]
-        }
-        val dets = YoloSegDecoder.decode(det, c, n, proto, nm, mh, mw, inW, inH)
-        YoloSegDecoder.rasterize(dets, depthW, depthH, out)
-        return out
+        val out = YoloSegDecoder.Outputs.of(dShape, rawDet, pShape, rawProto)
+        val dets = YoloSegDecoder.decode(out.det, out.channels, out.anchors, out.proto, out.numMasks,
+            out.maskH, out.maskW, layout.width, layout.height)
+        YoloSegDecoder.rasterize(dets, depthW, depthH, mask)
+        return mask
     }
 
     companion object {

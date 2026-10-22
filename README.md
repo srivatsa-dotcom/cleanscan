@@ -64,16 +64,25 @@ cleanscan process demo_session -o demo_world
 ./demo_world/run_gazebo.sh        # or: ./demo_world/run_gazebo.sh classic
 ```
 
-### 2. People/animal model for the apps (one time)
+### 2. People/animal model for the apps
 
-```bash
-pip install ultralytics
-python tools/export_models.py     # -> ios/Models/LivingSeg.mlpackage, android/.../living_seg.tflite
-```
+Ready-made models are already committed: `ios/Models/LivingSeg.mlpackage` and
+`android/app/src/main/assets/living_seg.tflite` (YOLO11n-seg). To re-export them, for
+example with a bigger model, run `python tools/export_models.py --help`. It lists the
+tested torch/NumPy versions.
 
-Without the model the iPhone app still removes people (ARKit) and cats/dogs (Apple Vision,
-box-masked). The Android app warns that it is not masking on the phone. Ghost removal and
-`--resegment` on the desktop still work in both cases.
+The Android detection path was checked end to end with the real model: the app's Kotlin
+decoder, then the TFLite model, then the depth-resolution mask. Its masks match the
+Ultralytics reference with an IoU of 0.94–0.98 on test photos of people and dogs
+(`docs/android_mask_test.png`, `tools/verify_android_model.py`).
+
+> **License:** Ultralytics YOLO models are AGPL-3.0. Publishing an app that bundles them
+> requires AGPL compliance or an Ultralytics Enterprise license. Any YOLO-seg-style model
+> trained on COCO classes (same output layout) can be swapped in.
+
+Without the model, the iPhone app still removes people (ARKit) and cats/dogs (Apple Vision,
+box-masked), and the Android app warns that it is not masking on the phone. Ghost removal
+and `--resegment` on the desktop still work in both cases.
 
 ### 3. iPhone app
 
@@ -152,7 +161,7 @@ To spawn the scan inside your own world:
 ios/        SwiftUI + ARKit + RealityKit app (XcodeGen project.yml)
 android/    Kotlin + ARCore + TFLite app (Gradle)
 pipeline/   Python package `cleanscan` + tests
-tools/      model export script
+tools/      model export + Android model/decoder verification (decoder-test/)
 docs/       capture_format.md (the shared phone→desktop format)
 ```
 

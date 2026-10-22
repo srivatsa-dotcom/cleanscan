@@ -2,7 +2,7 @@ import CoreGraphics
 import CoreML
 
 /// Decodes the raw outputs of an Ultralytics YOLO-seg model exported with nms=False:
-///   det   [1, 4 + numClasses + 32, N]  (cx, cy, w, h in input pixels, class scores, mask coeffs)
+///   det   [1, 4 + numClasses + 32, N]  (cx, cy, w, h in input pixels or 0..1, class scores, mask coeffs)
 ///   proto [1, 32, H/4, W/4]
 struct YOLOSegDecoder {
     struct Detection {
@@ -30,6 +30,11 @@ struct YOLOSegDecoder {
         let D = contiguous(det), P = contiguous(proto)
         let inW = Float(mw * 4), inH = Float(mh * 4)
 
+        // Core ML exports emit boxes in input pixels, TFLite/LiteRT exports normalised to 0..1.
+        // Anchor centres span the whole image, so the largest cx tells the two apart.
+        let maxCx = (0..<N).reduce(Float(0)) { max($0, D[$1]) }
+        let sx: Float = maxCx <= 2 ? 1 : inW, sy: Float = maxCx <= 2 ? 1 : inH
+
         struct Cand { var cls: Int; var score: Float; var box: CGRect; var coeffs: [Float] }
         var cands: [Cand] = []
         for i in 0..<N {
@@ -39,7 +44,7 @@ struct YOLOSegDecoder {
                 if s > best { best = s; bestC = c }
             }
             guard best >= confidence, bestC >= 0 else { continue }
-            let cx = D[i] / inW, cy = D[N + i] / inH, w = D[2 * N + i] / inW, h = D[3 * N + i] / inH
+            let cx = D[i] / sx, cy = D[N + i] / sy, w = D[2 * N + i] / sx, h = D[3 * N + i] / sy
             let box = CGRect(x: CGFloat(cx - w / 2), y: CGFloat(cy - h / 2), width: CGFloat(w), height: CGFloat(h))
             let coeffs = (0..<nm).map { D[(4 + nc + $0) * N + i] }
             cands.append(Cand(cls: bestC, score: best, box: box, coeffs: coeffs))

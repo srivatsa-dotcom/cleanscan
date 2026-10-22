@@ -8,7 +8,7 @@ import kotlin.math.min
  * Decodes raw Ultralytics YOLO-seg outputs (exported with nms=False). Pure Kotlin so it
  * can be unit-tested on the JVM.
  *
- *  det:   [C, N] with C = 4 + numClasses + numMasks (cx, cy, w, h in input pixels)
+ *  det:   [C, N] with C = 4 + numClasses + numMasks (cx, cy, w, h in input pixels or 0..1)
  *  proto: [numMasks, mh, mw]
  */
 object YoloSegDecoder {
@@ -28,6 +28,61 @@ object YoloSegDecoder {
         }
     }
 
+    /** Model input tensor layout. */
+    class InputLayout(val width: Int, val height: Int, val channelsFirst: Boolean) {
+        companion object {
+            fun of(shape: IntArray): InputLayout =
+                if (shape[1] == 3) InputLayout(shape[3], shape[2], true)  // [1, 3, H, W]
+                else InputLayout(shape[2], shape[1], false)  // [1, H, W, 3]
+        }
+    }
+
+    /** ARGB pixels (row-major, width x height of the layout) -> RGB floats in 0..1. */
+    fun packInput(px: IntArray, layout: InputLayout): FloatArray {
+        val n = layout.width * layout.height
+        val out = FloatArray(3 * n)
+        for (i in 0 until n) {
+            val p = px[i]
+            val r = ((p shr 16) and 0xFF) / 255f
+            val g = ((p shr 8) and 0xFF) / 255f
+            val b = (p and 0xFF) / 255f
+            if (layout.channelsFirst) {
+                out[i] = r; out[n + i] = g; out[2 * n + i] = b
+            } else {
+                out[3 * i] = r; out[3 * i + 1] = g; out[3 * i + 2] = b
+            }
+        }
+        return out
+    }
+
+    /** Raw output tensors normalised to det [C, N] and proto [numMasks, maskH, maskW]. */
+    class Outputs(val det: FloatArray, val channels: Int, val anchors: Int,
+                  val proto: FloatArray, val numMasks: Int, val maskH: Int, val maskW: Int) {
+        companion object {
+            fun of(detShape: IntArray, det: FloatArray, protoShape: IntArray, proto: FloatArray): Outputs {
+                // prototypes: [1, nm, mh, mw] or [1, mh, mw, nm]
+                val channelsLast = protoShape[3] < protoShape[1]
+                val nm = if (channelsLast) protoShape[3] else protoShape[1]
+                val mh = if (channelsLast) protoShape[1] else protoShape[2]
+                val mw = if (channelsLast) protoShape[2] else protoShape[3]
+                val p = if (!channelsLast) proto else FloatArray(proto.size).also { t ->
+                    for (y in 0 until mh) for (x in 0 until mw) for (k in 0 until nm)
+                        t[k * mh * mw + y * mw + x] = proto[(y * mw + x) * nm + k]
+                }
+                // detections: [1, C, N] or [1, N, C]
+                var c = detShape[1]
+                var n = detShape[2]
+                var d = det
+                if (c > n) {
+                    d = FloatArray(det.size)
+                    for (i in 0 until c) for (j in 0 until n) d[j * c + i] = det[i * n + j]
+                    c = detShape[2]; n = detShape[1]
+                }
+                return Outputs(d, c, n, p, nm, mh, mw)
+            }
+        }
+    }
+
     fun decode(
         det: FloatArray, channels: Int, anchors: Int,
         proto: FloatArray, numMasks: Int, mh: Int, mw: Int,
@@ -39,6 +94,13 @@ object YoloSegDecoder {
         data class Cand(val cls: Int, val score: Float, val x0: Float, val y0: Float,
                         val x1: Float, val y1: Float, val coeffs: FloatArray)
 
+        // TFLite/LiteRT exports emit boxes normalised to 0..1, Core ML exports in input pixels.
+        // Anchor centres span the whole image, so the largest cx tells the two apart.
+        var maxCx = 0f
+        for (i in 0 until anchors) maxCx = max(maxCx, det[i])
+        val sx = if (maxCx <= 2f) 1f else inputW.toFloat()
+        val sy = if (maxCx <= 2f) 1f else inputH.toFloat()
+
         val cands = ArrayList<Cand>()
         for (i in 0 until anchors) {
             var best = 0f
@@ -49,10 +111,10 @@ object YoloSegDecoder {
                 if (s > best) { best = s; bestC = c }
             }
             if (bestC < 0 || best < confidence) continue
-            val cx = det[i] / inputW
-            val cy = det[anchors + i] / inputH
-            val w = det[2 * anchors + i] / inputW
-            val h = det[3 * anchors + i] / inputH
+            val cx = det[i] / sx
+            val cy = det[anchors + i] / sy
+            val w = det[2 * anchors + i] / sx
+            val h = det[3 * anchors + i] / sy
             val coeffs = FloatArray(numMasks) { det[(4 + nc + it) * anchors + i] }
             cands.add(Cand(bestC, best, cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2, coeffs))
         }

@@ -19,16 +19,20 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # image ships with the Android SDK
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
+      - name: Android SDK packages
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" 2>&1 | tail -5 | tee sdk.log
 
       - name: Build debug APK
         working-directory: android
@@ -51,7 +55,7 @@ jobs:
       - name: Save build log to the ci-logs branch
         if: failure()
         run: |
-          cp build.log /tmp/build.log || echo "no build log" > /tmp/build.log
+          cat sdk.log build.log > /tmp/build.log 2>/dev/null || echo "failed before the Gradle build (see the Actions run)" > /tmp/build.log
           git config user.name "ci"
           git config user.email "ci@users.noreply.github.com"
           git checkout --orphan ci-logs

@@ -94,6 +94,13 @@ open CleanScan.xcodeproj         # set your Team under Signing, run on a LiDAR d
 
 ### 4. Android app
 
+**Ready-to-install test build:** download
+[CleanScan-debug.apk](https://github.com/srivatsa-dotcom/cleanscan/releases/download/android-latest/CleanScan-debug.apk)
+from the [android-latest release](https://github.com/srivatsa-dotcom/cleanscan/releases/tag/android-latest).
+GitHub Actions rebuilds it on every push that changes `android/` (`.github/workflows/android.yml`).
+
+To build it yourself:
+
 Open `android/` in Android Studio (Koala or newer) and press Run. Or, with the Android SDK
 installed: `cd android && ./gradlew installDebug`.
 

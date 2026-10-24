@@ -94,3 +94,16 @@ def test_ghost_removal_without_masks(tmp_path):
     pb, db, _ = _living_points(tmp_path / "b", "b")
     assert with_ghost["ghost_triangles_removed"] > 0
     assert pa + da < 0.5 * (pb + db), (pa, da, pb, db)
+
+
+def test_camera_only_capture_uses_stereo(tmp_path):
+    """Phones without LiDAR/ToF (e.g. iPhone 11): depth comes from multi-view stereo."""
+    ses = make_session(tmp_path / "session", n_frames=120, with_depth=False, trajectory="walk")
+    assert not any((tmp_path / "session" / "depth").iterdir())
+    rep = run(ses, tmp_path / "out", _cfg("rgb", texture_mode="none"))
+    assert rep["depth_source"] == "stereo"
+    person, dog, p = _living_points(tmp_path / "out", "rgb")
+    assert person == 0 and dog == 0
+    assert abs(np.median(p[p[:, 2] < 0.1, 2])) < 0.02  # floor levelled
+    ex = rep["extent_m"]
+    assert 5.5 < ex[0] < 6.6 and 4.5 < ex[1] < 5.6  # 6 x 5 m room, metric scale from ARKit poses

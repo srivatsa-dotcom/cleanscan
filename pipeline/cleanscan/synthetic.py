@@ -69,7 +69,10 @@ def _pose(theta: float, phi: float, pos) -> np.ndarray:
 
 def make_session(out: str | Path, n_frames: int = 160, with_masks: bool = True,
                  color_size=(640, 480), depth_size=(256, 192), noise: float = 0.004,
-                 seed: int = 0) -> Path:
+                 seed: int = 0, with_depth: bool = True, trajectory: str = "spin") -> Path:
+    """``with_depth=False`` imitates a phone without LiDAR/ToF (e.g. iPhone 11).
+    ``trajectory``: "spin" turns on the spot (fine with a depth sensor), "walk" walks a
+    loop looking at the walls, which camera-only (stereo) capture needs."""
     out = Path(out)
     for d in ("color", "depth", "confidence", "mask"):
         (out / d).mkdir(parents=True, exist_ok=True)
@@ -85,9 +88,15 @@ def make_session(out: str | Path, n_frames: int = 160, with_masks: bool = True,
     lines = []
     for i in range(n_frames):
         s = i / max(n_frames - 1, 1)
-        theta = 4 * np.pi * s  # two full turns
-        phi = np.radians(-25 + 15 * np.sin(6 * np.pi * s))
-        pos = (0.4 * np.sin(2 * np.pi * s), 1.4, 0.3 * np.cos(2 * np.pi * s))
+        if trajectory == "walk":
+            a = 2 * np.pi * s
+            theta = np.arctan2(-np.cos(a), -np.sin(a))  # look outwards, at the walls
+            phi = np.radians(-20 + 10 * np.sin(4 * np.pi * s))
+            pos = (1.0 * np.cos(a), 1.4, 0.8 * np.sin(a))
+        else:
+            theta = 4 * np.pi * s  # two full turns
+            phi = np.radians(-25 + 15 * np.sin(6 * np.pi * s))
+            pos = (0.4 * np.sin(2 * np.pi * s), 1.4, 0.3 * np.cos(2 * np.pi * s))
         pose_gl = _pose(theta, phi, pos)
         pose_cv = pose_gl @ GL_TO_CV
 
@@ -116,18 +125,21 @@ def make_session(out: str | Path, n_frames: int = 160, with_masks: bool = True,
         name = f"{i:06d}"
         cv2.imwrite(str(out / "color" / f"{name}.jpg"), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
                     [cv2.IMWRITE_JPEG_QUALITY, 92])
-        cv2.imwrite(str(out / "depth" / f"{name}.png"), np.clip(depth * 1000, 0, 65535).astype(np.uint16))
-        cv2.imwrite(str(out / "confidence" / f"{name}.png"), np.full(td.shape, 2, np.uint8))
+        if with_depth:
+            cv2.imwrite(str(out / "depth" / f"{name}.png"), np.clip(depth * 1000, 0, 65535).astype(np.uint16))
+            cv2.imwrite(str(out / "confidence" / f"{name}.png"), np.full(td.shape, 2, np.uint8))
         rec = {
             "index": i, "timestamp": i / 10.0,
-            "color": f"color/{name}.jpg", "depth": f"depth/{name}.png",
-            "confidence": f"confidence/{name}.png",
+            "color": f"color/{name}.jpg",
             "color_intrinsics": [Kc[0, 0], Kc[1, 1], Kc[0, 2], Kc[1, 2]],
             "color_size": list(color_size),
             "depth_intrinsics": [Kd[0, 0], Kd[1, 1], Kd[0, 2], Kd[1, 2]],
             "depth_size": list(depth_size),
             "camera_to_world": pose_gl.reshape(-1).tolist(),
         }
+        if with_depth:
+            rec["depth"] = f"depth/{name}.png"
+            rec["confidence"] = f"confidence/{name}.png"
         if with_masks:
             cv2.imwrite(str(out / "mask" / f"{name}.png"), mask)
             rec["mask"] = f"mask/{name}.png"
@@ -138,5 +150,6 @@ def make_session(out: str | Path, n_frames: int = 160, with_masks: bool = True,
         "format": "cleanscan-capture", "version": 1, "platform": "synthetic",
         "device": "synthetic", "depth_unit": 0.001, "confidence_levels": 3,
         "world_up": "y", "camera_convention": "opengl",
+        "depth_source": "synthetic" if with_depth else "none",
     }, indent=2))
     return out

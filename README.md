@@ -43,7 +43,7 @@ animal are skipped, so nobody gets "painted" onto the walls.
 
 | | |
 |---|---|
-| iPhone / iPad | **LiDAR required**: iPhone 12 Pro or newer Pro / Pro Max, or iPad Pro 2020+. iOS 16+. |
+| iPhone / iPad | iOS 16+. **Best:** LiDAR models (iPhone 12 Pro or newer Pro / Pro Max, iPad Pro 2020+). **Also works:** iPhones without LiDAR (e.g. iPhone 11, XR, SE 2nd gen+) in camera-only mode, with depth computed on the computer (less accurate). |
 | Android | Phone on the [ARCore Depth API list](https://developers.google.com/ar/devices). A ToF sensor gives much better results. Android 8+. |
 | Desktop | Python 3.10–3.13, `pip install ./pipeline` (Open3D, OpenCV, NumPy). Linux, macOS or Windows. |
 | Gazebo | Gazebo Harmonic/Ionic/Jetty (`gz sim`) **or** Gazebo Classic 11. |
@@ -85,6 +85,32 @@ box-masked), and the Android app warns that it is not masking on the phone. Ghos
 and `--resegment` on the desktop still work in both cases.
 
 ### 3. iPhone app
+
+**Install the test build without a Mac:** GitHub builds an unsigned app on every push that
+changes `ios/` (`.github/workflows/ios.yml`). Download
+[CleanScan-unsigned.ipa](https://github.com/srivatsa-dotcom/cleanscan/releases/download/ios-latest/CleanScan-unsigned.ipa)
+from the [ios-latest release](https://github.com/srivatsa-dotcom/cleanscan/releases/tag/ios-latest),
+then sign and install it with your Apple ID:
+
+1. On a Windows PC or a Mac, install [Sideloadly](https://sideloadly.io) (on Windows also
+   iTunes and iCloud from Apple's website, not the Microsoft Store versions).
+2. Connect the iPhone by USB and tap **Trust**. Open Sideloadly, drop in the `.ipa`, enter
+   your Apple ID and press **Start**.
+3. On the iPhone: Settings → General → VPN & Device Management → your Apple ID → **Trust**;
+   then Settings → Privacy & Security → **Developer Mode** → on (restart when asked).
+4. With a free Apple ID the app stops opening after 7 days; reinstall it the same way.
+
+**Camera-only mode (no LiDAR, e.g. iPhone 11).** The app records colour, ARKit poses and
+people masks, and `cleanscan process` computes depth by multi-view stereo between frames,
+in real metres from ARKit's poses. How to scan for it:
+
+* **Walk sideways** along the walls with the phone facing them, about 1–2 m away. Turning
+  on the spot gives the computer no depth.
+* Plain white walls and glossy surfaces produce holes. Textured rooms work best.
+* Expect a few centimetres of error, against about 1 cm with LiDAR. On a synthetic room the
+  stereo depth had a median error of 1.6 cm; real scans will be worse.
+
+**Build it yourself on a Mac:**
 
 ```bash
 brew install xcodegen
@@ -174,6 +200,8 @@ docs/       capture_format.md (the shared phone→desktop format)
 
 ## Known limitations
 
+* Camera-only scans (iPhones without LiDAR) are less accurate and leave holes on texture-less
+  surfaces; their depth is estimated by stereo, so the walking technique matters a lot.
 * Scan accuracy depends on the phone's depth sensor (iPhone LiDAR: about 1 cm at 1 m, usable
   to about 5 m) and on ARKit/ARCore drift over long scans. Scan big buildings in parts.
 * A being that never moves is removed but leaves a hole where nothing behind it was seen.

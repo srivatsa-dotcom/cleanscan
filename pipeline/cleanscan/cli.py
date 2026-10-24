@@ -55,6 +55,10 @@ def main(argv=None) -> int:
     s.add_argument("out", type=Path)
     s.add_argument("--frames", type=int, default=160)
     s.add_argument("--no-masks", action="store_true", help="omit masks to test ghost removal alone")
+    s.add_argument("--no-depth", action="store_true",
+                   help="camera-only capture like a phone without LiDAR (depth by stereo)")
+    s.add_argument("--trajectory", choices=["spin", "walk"], default=None,
+                   help="camera path (default: spin with depth, walk without)")
 
     i = sub.add_parser("inspect", help="print a summary of a session")
     i.add_argument("session", type=Path)
@@ -64,7 +68,9 @@ def main(argv=None) -> int:
 
     if a.cmd == "synth":
         from .synthetic import make_session
-        print(make_session(a.out, n_frames=a.frames, with_masks=not a.no_masks))
+        traj = a.trajectory or ("walk" if a.no_depth else "spin")
+        print(make_session(a.out, n_frames=a.frames, with_masks=not a.no_masks,
+                           with_depth=not a.no_depth, trajectory=traj))
         return 0
 
     session_dir = _unpack(a.session)

@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import open3d as o3d
 
-from . import gazebo, ghosts, mesh as meshops, occupancy
+from . import gazebo, ghosts, mesh as meshops, occupancy, stereo
 from .fusion import FusionConfig, integrate
 from .masks import resegment_session
 from .session import Session
@@ -26,6 +26,7 @@ class PipelineConfig:
     name: str = "scan"
     fusion: FusionConfig = field(default_factory=FusionConfig)
     texture: TextureConfig = field(default_factory=TextureConfig)
+    stereo: stereo.StereoConfig = field(default_factory=stereo.StereoConfig)
     texture_mode: str = "photo"  # photo | none
     ghost_removal: bool = True
     ghost_min_votes: int = 3
@@ -61,6 +62,10 @@ def run(session_dir: str | Path, out_dir: str | Path, cfg: PipelineConfig) -> di
     log.info("loaded %d frames from %s (%s)", len(session.frames), session_dir,
              session.meta.get("platform", "?"))
 
+    camera_only = not session.has_sensor_depth
+    if camera_only:
+        log.info("camera-only capture (no LiDAR/ToF): computing depth by multi-view stereo")
+        stereo.estimate_session_depth(session, cfg.stereo)
     if cfg.fusion.min_confidence is None:
         cfg.fusion.min_confidence = float(session.meta.get("recommended_min_confidence", 0.5))
 
@@ -115,6 +120,7 @@ def run(session_dir: str | Path, out_dir: str | Path, cfg: PipelineConfig) -> di
     report = {
         "name": cfg.name,
         "frames": len(session.frames),
+        "depth_source": "stereo" if camera_only else "sensor",
         "platform": session.meta.get("platform"),
         "triangles_visual": len(aligned.triangles),
         "triangles_collision": len(collision.triangles),

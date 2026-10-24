@@ -29,7 +29,7 @@ class Frame:
     index: int
     timestamp: float
     color_path: Path
-    depth_path: Path
+    depth_path: Path | None  # None: camera-only capture (no LiDAR/ToF), depth is estimated
     confidence_path: Path | None
     mask_path: Path | None
     K_color: np.ndarray
@@ -83,7 +83,7 @@ class Session:
                         index=int(f["index"]),
                         timestamp=float(f.get("timestamp", 0.0)),
                         color_path=root / f["color"],
-                        depth_path=root / f["depth"],
+                        depth_path=opt("depth"),
                         confidence_path=opt("confidence"),
                         mask_path=opt("mask"),
                         K_color=intrinsics_matrix(*f["color_intrinsics"]),
@@ -98,9 +98,15 @@ class Session:
         frames.sort(key=lambda fr: fr.timestamp)
         return cls(root, meta, frames)
 
+    @property
+    def has_sensor_depth(self) -> bool:
+        return all(f.depth_path is not None for f in self.frames)
+
     # ------------------------------------------------------------------ loaders
     def load_depth(self, frame: Frame) -> np.ndarray:
         """Depth in metres, float32 (H, W); 0 = invalid."""
+        if frame.depth_path is None:
+            raise ValueError("frame has no depth - run stereo.estimate_session_depth first")
         raw = cv2.imread(str(frame.depth_path), cv2.IMREAD_UNCHANGED)
         if raw is None:
             raise IOError(f"cannot read {frame.depth_path}")

@@ -55,7 +55,6 @@ struct ContentView: View {
                                 .frame(width: scan.isRecording ? 34 : 66, height: scan.isRecording ? 34 : 66)
                         }
                     }
-                    .disabled(!scan.lidarAvailable)
 
                     Button { scan.showMesh.toggle() } label: {
                         Image(systemName: scan.showMesh ? "cube.transparent.fill" : "cube.transparent")

@@ -4,6 +4,8 @@ import RealityKit
 import UIKit
 
 /// Drives the AR session and records RGB + LiDAR depth + pose + people/animal masks.
+/// Without LiDAR (e.g. iPhone 11) it records camera-only scans; depth is then computed
+/// on the computer from stereo between frames (pipeline/cleanscan/stereo.py).
 final class ScanController: NSObject, ObservableObject, ARSessionDelegate {
     @Published var isRecording = false
     @Published var frameCount = 0
@@ -36,6 +38,20 @@ final class ScanController: NSObject, ObservableObject, ARSessionDelegate {
         startSession()
     }
 
+    var cameraOnly: Bool { !lidarAvailable }
+
+    private var idleHint: String {
+        cameraOnly
+            ? "No LiDAR: camera-only mode. Walk slowly sideways along the walls, phone facing them"
+            : "Point at the room, then press Record"
+    }
+
+    private var recordingHint: String {
+        cameraOnly
+            ? "Recording - keep walking sideways, slowly; avoid turning on the spot"
+            : "Recording - move slowly, cover every wall and the floor"
+    }
+
     func startSession() {
         guard let view = arView else { return }
         let config = ARWorldTrackingConfiguration()
@@ -57,14 +73,14 @@ final class ScanController: NSObject, ObservableObject, ARSessionDelegate {
         }
         view.session.run(config, options: [.resetTracking, .removeExistingAnchors])
         updateDebugOptions()
-        if !lidarAvailable {
-            status = "This device has no LiDAR - scanning needs an iPhone/iPad Pro"
-        }
+        status = idleHint
     }
 
     private func updateDebugOptions() {
         guard let view = arView else { return }
-        if showMesh { view.debugOptions.insert(.showSceneUnderstanding) } else { view.debugOptions.remove(.showSceneUnderstanding) }
+        // LiDAR devices show the live mesh; others show ARKit's tracked feature points.
+        let option: ARView.DebugOptions = cameraOnly ? .showFeaturePoints : .showSceneUnderstanding
+        if showMesh { view.debugOptions.insert(option) } else { view.debugOptions.remove(option) }
     }
 
     // MARK: recording
@@ -74,13 +90,12 @@ final class ScanController: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     private func start() {
-        guard lidarAvailable else { return }
         do {
-            writer = try SessionWriter.create()
+            writer = try SessionWriter.create(depthSource: cameraOnly ? "none" : "lidar")
             frameCount = 0
             lastPose = nil
             isRecording = true
-            status = "Recording - move slowly, cover every wall and the floor"
+            status = recordingHint
             UIApplication.shared.isIdleTimerDisabled = true
         } catch {
             status = "Cannot start: \(error.localizedDescription)"
@@ -106,7 +121,8 @@ final class ScanController: NSObject, ObservableObject, ARSessionDelegate {
             status = "Tracking limited - slow down / add light"
             return
         }
-        guard let depth = frame.sceneDepth else { return }
+        let depth = frame.sceneDepth
+        if !cameraOnly && depth == nil { return }
         let now = frame.timestamp
         guard now - lastCapture >= minInterval else { return }
         let pose = frame.camera.transform
@@ -124,8 +140,8 @@ final class ScanController: NSObject, ObservableObject, ARSessionDelegate {
         let item = CapturedFrame(
             timestamp: now,
             image: frame.capturedImage,
-            depth: depth.depthMap,
-            confidence: depth.confidenceMap,
+            depth: depth?.depthMap,
+            confidence: depth?.confidenceMap,
             personSegmentation: frame.segmentationBuffer,
             intrinsics: frame.camera.intrinsics,
             imageResolution: frame.camera.imageResolution,
@@ -145,7 +161,7 @@ final class ScanController: NSObject, ObservableObject, ARSessionDelegate {
                     self.maskPreview = preview
                     self.status = mask.maskedFraction > 0.001
                         ? "Recording - people/animals detected and removed"
-                        : "Recording - move slowly, cover every wall and the floor"
+                        : self.recordingHint
                 case .failure(let error):
                     self.status = "Write failed: \(error.localizedDescription)"
                     self.stop()
@@ -163,14 +179,16 @@ final class ScanController: NSObject, ObservableObject, ARSessionDelegate {
 struct CapturedFrame {
     let timestamp: TimeInterval
     let image: CVPixelBuffer
-    let depth: CVPixelBuffer
+    let depth: CVPixelBuffer?  // nil in camera-only mode
     let confidence: CVPixelBuffer?
     let personSegmentation: CVPixelBuffer?
     let intrinsics: simd_float3x3
     let imageResolution: CGSize
     let cameraToWorld: simd_float4x4
 
+    /// Resolution of depth, confidence and mask images (LiDAR depth size, else 256x192).
     var depthSize: (width: Int, height: Int) {
-        (CVPixelBufferGetWidth(depth), CVPixelBufferGetHeight(depth))
+        guard let depth else { return (256, 192) }
+        return (CVPixelBufferGetWidth(depth), CVPixelBufferGetHeight(depth))
     }
 }

@@ -16,14 +16,16 @@ final class SessionWriter {
         return docs.appendingPathComponent("Scans", isDirectory: true)
     }
 
-    static func create() throws -> SessionWriter {
+    /// - Parameter depthSource: "lidar", or "none" for camera-only devices (depth is
+    ///   computed on the computer from stereo between frames).
+    static func create(depthSource: String) throws -> SessionWriter {
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyyMMdd-HHmmss"
         let dir = scansDirectory.appendingPathComponent("Scan-\(fmt.string(from: Date()))", isDirectory: true)
-        return try SessionWriter(directory: dir)
+        return try SessionWriter(directory: dir, depthSource: depthSource)
     }
 
-    private init(directory: URL) throws {
+    private init(directory: URL, depthSource: String) throws {
         self.directory = directory
         let fm = FileManager.default
         for sub in ["color", "depth", "confidence", "mask"] {
@@ -38,6 +40,7 @@ final class SessionWriter {
             "confidence_levels": 3,  // ARConfidenceLevel low/medium/high
             "world_up": "y",
             "camera_convention": "opengl",
+            "depth_source": depthSource,
         ]
         try JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted, .sortedKeys])
             .write(to: directory.appendingPathComponent("session.json"))
@@ -59,21 +62,25 @@ final class SessionWriter {
         else { throw CocoaError(.fileWriteUnknown) }
         try jpg.write(to: colorURL)
 
-        // depth: metres (Float32) -> millimetres (UInt16 PNG)
-        var depthMM = [UInt16](repeating: 0, count: dw * dh)
-        CVPixelBufferLockBaseAddress(f.depth, .readOnly)
-        if let base = CVPixelBufferGetBaseAddress(f.depth) {
-            let stride = CVPixelBufferGetBytesPerRow(f.depth) / MemoryLayout<Float32>.size
-            let p = base.assumingMemoryBound(to: Float32.self)
-            for y in 0..<dh {
-                for x in 0..<dw {
-                    let d = p[y * stride + x]
-                    depthMM[y * dw + x] = d.isFinite && d > 0 ? UInt16(min(65535, (d * 1000).rounded())) : 0
+        // depth: metres (Float32) -> millimetres (UInt16 PNG); absent in camera-only mode
+        var depthPath: String?
+        if let depth = f.depth {
+            var depthMM = [UInt16](repeating: 0, count: dw * dh)
+            CVPixelBufferLockBaseAddress(depth, .readOnly)
+            if let base = CVPixelBufferGetBaseAddress(depth) {
+                let stride = CVPixelBufferGetBytesPerRow(depth) / MemoryLayout<Float32>.size
+                let p = base.assumingMemoryBound(to: Float32.self)
+                for y in 0..<dh {
+                    for x in 0..<dw {
+                        let d = p[y * stride + x]
+                        depthMM[y * dw + x] = d.isFinite && d > 0 ? UInt16(min(65535, (d * 1000).rounded())) : 0
+                    }
                 }
             }
+            CVPixelBufferUnlockBaseAddress(depth, .readOnly)
+            try writePNG16(depthMM, width: dw, height: dh, to: directory.appendingPathComponent("depth/\(name).png"))
+            depthPath = "depth/\(name).png"
         }
-        CVPixelBufferUnlockBaseAddress(f.depth, .readOnly)
-        try writePNG16(depthMM, width: dw, height: dh, to: directory.appendingPathComponent("depth/\(name).png"))
 
         var confPath: String?
         if let conf = f.confidence {
@@ -104,7 +111,6 @@ final class SessionWriter {
             "index": index,
             "timestamp": f.timestamp,
             "color": "color/\(name).jpg",
-            "depth": "depth/\(name).png",
             "mask": "mask/\(name).png",
             "color_intrinsics": [fx, fy, cx, cy],
             "color_size": [Int(iw), Int(ih)],
@@ -112,6 +118,7 @@ final class SessionWriter {
             "depth_size": [dw, dh],
             "camera_to_world": pose,
         ]
+        if let depthPath { rec["depth"] = depthPath }
         if let confPath { rec["confidence"] = confPath }
         var line = try JSONSerialization.data(withJSONObject: rec, options: [.sortedKeys])
         line.append(0x0A)

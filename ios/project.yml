@@ -23,7 +23,7 @@ targets:
       path: CleanScan/Info.plist
       properties:
         CFBundleDisplayName: CleanScan
-        NSCameraUsageDescription: CleanScan uses the camera and LiDAR to scan your environment.
+        NSCameraUsageDescription: CleanScan uses the camera (and LiDAR where available) to scan your environment.
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         UIRequiredDeviceCapabilities: [arkit]

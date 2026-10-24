@@ -100,6 +100,18 @@ then sign and install it with your Apple ID:
    then Settings → Privacy & Security → **Developer Mode** → on (restart when asked).
 4. With a free Apple ID the app stops opening after 7 days; reinstall it the same way.
 
+**On Linux (e.g. Ubuntu 22.04)**, use the Sideloader CLI instead of Sideloadly. This repo
+builds it for x86_64 (`.github/workflows/sideloader.yml`):
+
+```bash
+sudo apt install -y usbmuxd libimobiledevice6 libimobiledevice-utils libplist3
+wget https://github.com/srivatsa-dotcom/cleanscan/releases/download/sideloader-linux/sideloader-linux-x86_64
+wget https://github.com/srivatsa-dotcom/cleanscan/releases/download/ios-latest/CleanScan-unsigned.ipa
+chmod +x sideloader-linux-x86_64
+idevicepair pair                      # tap Trust on the iPhone, then run it again
+./sideloader-linux-x86_64 install -i CleanScan-unsigned.ipa
+```
+
 **Camera-only mode (no LiDAR, e.g. iPhone 11).** The app records colour, ARKit poses and
 people masks, and `cleanscan process` computes depth by multi-view stereo between frames,
 in real metres from ARKit's poses. How to scan for it:

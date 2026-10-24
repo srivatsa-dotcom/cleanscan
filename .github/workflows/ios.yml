@@ -1,0 +1,66 @@
+# Builds the iPhone app on a GitHub macOS runner and publishes an UNSIGNED .ipa as the
+# "ios-latest" release. Sign + install it with your own Apple ID (e.g. Sideloadly),
+# see README "iPhone app". On failure the xcodebuild log goes to the `ci-logs-ios` branch.
+name: iOS app
+
+on:
+  push:
+    branches: [main]
+    paths: ["ios/**", ".github/workflows/ios.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-ipa
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Tools
+        run: |
+          xcodebuild -version
+          brew install xcodegen
+
+      - name: Build unsigned app
+        working-directory: ios
+        run: |
+          xcodegen generate
+          set -o pipefail
+          xcodebuild -project CleanScan.xcodeproj -target CleanScan -configuration Release \
+            -sdk iphoneos SYMROOT="$PWD/build" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee ../ios-build.log | grep -E "error:|warning: .*CleanScan|BUILD" || true
+          test -d build/Release-iphoneos/CleanScan.app
+
+      - name: Package .ipa and publish release "ios-latest"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir Payload
+          cp -R ios/build/Release-iphoneos/CleanScan.app Payload/
+          zip -qry CleanScan-unsigned.ipa Payload
+          gh release delete ios-latest --yes --cleanup-tag || true
+          gh release create ios-latest CleanScan-unsigned.ipa \
+            --prerelease \
+            --title "CleanScan iPhone - latest test build (unsigned)" \
+            --notes "Unsigned build of ${GITHUB_SHA::7}. Sign and install it with your Apple ID using Sideloadly (Windows/macOS) or AltStore; see the README."
+
+      - name: Save build log to the ci-logs-ios branch
+        if: failure()
+        run: |
+          cp ios-build.log /tmp/build.log 2>/dev/null || echo "failed before xcodebuild (see the Actions run)" > /tmp/build.log
+          git config user.name "ci"
+          git config user.email "ci@users.noreply.github.com"
+          git checkout --orphan ci-logs-ios
+          git rm -rf --cached . > /dev/null
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp /tmp/build.log build.log
+          git add build.log
+          git commit -m "iOS build log for ${GITHUB_SHA::7}"
+          git push --force origin ci-logs-ios

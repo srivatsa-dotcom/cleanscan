@@ -171,6 +171,13 @@ To spawn the scan inside your own world:
 `<include><uri>model://my_room</uri></include>` with `GZ_SIM_RESOURCE_PATH`
 (or `GAZEBO_MODEL_PATH`) pointing at `my_room/models`.
 
+## No LiDAR phone? Add one: the CleanScan rig
+
+A Raspberry Pi Zero + an LD06/LD19 2D LiDAR (about ₹4,000 together) clipped to an iPhone 11
+or any phone turns it into a LiDAR scanner: in simulation, 0.9 cm median error against
+1.3 cm camera-only, with the LiDAR mount calibrated automatically. Parts, wiring, Pi setup
+and scanning steps: [rig/README.md](rig/README.md).
+
 ## Tips for a near-perfect scan
 
 * **Let living beings move.** The background behind a person can only be rebuilt if some

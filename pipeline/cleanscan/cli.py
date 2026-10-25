@@ -50,6 +50,8 @@ def main(argv=None) -> int:
     p.add_argument("--robot-height", type=float, default=1.8,
                    help="obstacles below this height go into the 2D nav map")
     p.add_argument("--no-center", action="store_true", help="keep the capture origin instead of centering")
+    p.add_argument("--rig-no-stereo", action="store_true",
+                   help="LiDAR-rig scans: fuse only the external LiDAR, skip camera stereo (faster)")
 
     s = sub.add_parser("synth", help="write a synthetic demo session (room + walking person + dog)")
     s.add_argument("out", type=Path)
@@ -96,6 +98,7 @@ def main(argv=None) -> int:
         map_resolution=a.map_resolution,
         map_obstacle_max_z=a.robot_height,
         center_xy=not a.no_center,
+        rig_stereo=not a.rig_no_stereo,
     )
     report = run(session_dir, a.out, cfg)
     print(json.dumps({k: report[k] for k in ("name", "frames", "triangles_visual",

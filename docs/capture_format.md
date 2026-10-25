@@ -11,7 +11,14 @@ Scan-20261022-101500/
   depth/000000.png    # 16-bit grayscale, millimetres, 0 = no data
   confidence/000000.png  # 8-bit, 0..confidence_levels-1 (optional)
   mask/000000.png     # 8-bit, 255 = person/animal, 0 = static scene (depth resolution)
+  poses.bin           # optional: every ARKit pose (~60 Hz)
+  lidar.bin           # optional: external LiDAR rig readings (rig/README.md)
+  rig.json            # optional: rig sensor description, written when lidar.bin exists
+  planes.json         # optional: ARKit plane anchors at the end of the scan
 ```
+
+`depth/` and `confidence/` are absent for camera-only captures (phones without LiDAR/ToF);
+`frames.jsonl` then has no `depth` key and the pipeline computes depth by stereo.
 
 ## session.json
 
@@ -41,3 +48,18 @@ Scan-20261022-101500/
 ARKit (`ARCamera.transform`) and ARCore (`Camera.getPose()`) both use exactly this
 convention, so no per-platform conversion is needed in the pipeline. The pipeline
 converts to the Gazebo/ROS convention (Z up, floor at z = 0) itself.
+
+## High-rate streams (little-endian, packed)
+
+| file | record | size |
+| --- | --- | --- |
+| `poses.bin` | f64 time (phone clock, same as `timestamp`) + 16 x f32 camera_to_world, row-major | 72 B |
+| `lidar.bin` | f64 time (phone clock) + f32 angle (rad, counter-clockwise in the sensor frame) + f32 range (m, 0 = none) + u8 intensity | 17 B |
+
+LiDAR sensor frame: x = sensor front (the 1D beam), y = left, z = up; a 2D sensor scans
+its x-y plane. The LiDAR->camera transform is found automatically by the pipeline, or can
+be given as `"extrinsic"` (16 numbers, row-major, LiDAR -> OpenGL camera) in `rig.json`.
+
+`planes.json`: list of `{"transform": 16 numbers row-major, "center": [x,y,z],
+"extent": [x, 0, z], "alignment": "horizontal"|"vertical"}`; the plane lies in its local
+x-z plane, normal = local +y (ARKit convention).

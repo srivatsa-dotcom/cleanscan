@@ -65,7 +65,8 @@ def floor_alignment(mesh_zup: o3d.geometry.TriangleMesh, center_xy: bool = True)
     pcd = mesh_zup.sample_points_uniformly(number_of_points=200_000, use_triangle_normal=True)
     pts = np.asarray(pcd.points)
     nrm = np.asarray(pcd.normals)
-    horiz = np.abs(nrm[:, 2]) > 0.9
+    # floor surfaces face up (TSDF normals point to the free side); ceilings face down
+    horiz = nrm[:, 2] > 0.9
     T = np.eye(4)
     if horiz.sum() < 500:
         log.warning("no floor found; keeping phone gravity alignment")
@@ -79,7 +80,7 @@ def floor_alignment(mesh_zup: o3d.geometry.TriangleMesh, center_xy: bool = True)
             plane, inl = remaining.segment_plane(0.02, 3, 1000)
             p = np.asarray(remaining.points)[inl]
             a, b, c, d = plane
-            if abs(c) > 0.95 and len(inl) > 0.05 * len(cand):
+            if abs(c) > 0.95 and len(inl) > 0.02 * len(cand):
                 if best is None or p[:, 2].mean() < best[1]:
                     best = (np.array(plane), p[:, 2].mean())
             remaining = remaining.select_by_index(inl, invert=True)

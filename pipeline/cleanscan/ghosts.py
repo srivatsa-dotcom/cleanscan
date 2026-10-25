@@ -54,9 +54,12 @@ def _stable_depth(depth: np.ndarray) -> np.ndarray:
 
 def detect_ghost_masks(session: Session, mesh: o3d.geometry.TriangleMesh, cfg: FusionConfig,
                        masks: dict[int, np.ndarray] | None = None,
-                       min_votes: int = 3, ratio: float = 0.5,
+                       min_votes: int = 3, ratio: float = 0.5, cloud=None,
                        ) -> tuple[dict[int, np.ndarray], np.ndarray]:
-    """Returns (per-frame extra masks at depth resolution, transient flag per triangle)."""
+    """Returns (per-frame extra masks at depth resolution, transient flag per triangle).
+
+    With an external-LiDAR ``cloud`` (lidar.LidarCloud), every kept ray also votes, and
+    readings that measured a transient surface get ``cloud.keep`` set to False."""
     n_tri = len(mesh.triangles)
     if n_tri == 0:
         return {}, np.zeros(0, bool)
@@ -67,6 +70,8 @@ def detect_ghost_masks(session: Session, mesh: o3d.geometry.TriangleMesh, cfg: F
 
     depths = {}
     for fr in session.frames:
+        if fr.depth_path is None:
+            continue  # LiDAR-rig scan fused without camera depth
         depth, _ = prepare_depth(session, fr, cfg,
                                  mask_override=None if masks is None else masks.get(fr.index))
         depth[~_stable_depth(depth)] = 0
@@ -78,14 +83,24 @@ def detect_ghost_masks(session: Session, mesh: o3d.geometry.TriangleMesh, cfg: F
         free[idx[good & (d > z + tau)]] += 1
         occ[idx[good & (np.abs(d - z) <= tau)]] += 1
 
+    ray_prim = ray_occ = ray_idx = None
+    if cloud is not None:
+        ray_idx, ray_prim, ray_occ = _lidar_votes(mesh, cloud, cfg, free, occ)
+
     transient = (free >= min_votes) & (free > ratio * occ)
     log.info("ghost removal: %d / %d triangles flagged transient", int(transient.sum()), n_tri)
+    if cloud is not None and transient.any():
+        drop = ray_occ & transient[np.clip(ray_prim, 0, None)] & (ray_prim >= 0)
+        cloud.keep[ray_idx[drop]] = False
+        log.info("ghost removal: %d LiDAR readings measured transient objects", int(drop.sum()))
 
     extra = {}
     if transient.any():
         Ct = C[transient]
         k = np.ones((3, 3), np.uint8)
         for fr in session.frames:
+            if fr.index not in depths:
+                continue
             depth = depths[fr.index]
             idx, u, v, z = _project(Ct, fr)
             d = depth[v, u]
@@ -96,3 +111,25 @@ def detect_ghost_masks(session: Session, mesh: o3d.geometry.TriangleMesh, cfg: F
                 m[v[hit], u[hit]] = 1
                 extra[fr.index] = cv2.dilate(m, k) > 0
     return extra, transient
+
+
+def _lidar_votes(mesh, cloud, cfg: FusionConfig, free: np.ndarray, occ: np.ndarray):
+    """Trace every kept LiDAR ray; a surface in front of the measured point was seen
+    through (free vote), the surface at the measured point is confirmed (occupied vote)."""
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+    idx = np.nonzero(cloud.keep)[0]
+    d = cloud.points[idx] - cloud.origins[idx]
+    L = np.linalg.norm(d, axis=1)
+    rays = np.concatenate([cloud.origins[idx], d / L[:, None]], 1).astype(np.float32)
+    ans = scene.cast_rays(o3d.core.Tensor(rays))
+    t_hit = ans["t_hit"].numpy()
+    prim = ans["primitive_ids"].numpy().astype(np.int64)
+    hit = np.isfinite(t_hit)
+    prim[~hit] = -1
+    tau = np.maximum(2.0 * cfg.sdf_trunc, 0.02 * L)
+    through = hit & (t_hit < L - tau)
+    confirm = hit & (np.abs(t_hit - L) <= tau)
+    free += np.bincount(prim[through], minlength=len(free)).astype(free.dtype)
+    occ += np.bincount(prim[confirm], minlength=len(occ)).astype(occ.dtype)
+    return idx, prim, confirm

@@ -107,3 +107,33 @@ def test_camera_only_capture_uses_stereo(tmp_path):
     assert abs(np.median(p[p[:, 2] < 0.1, 2])) < 0.02  # floor levelled
     ex = rep["extent_m"]
     assert 5.5 < ex[0] < 6.6 and 4.5 < ex[1] < 5.6  # 6 x 5 m room, metric scale from ARKit poses
+
+
+def test_phone_plus_external_lidar_rig(tmp_path):
+    """iPhone 11 (no LiDAR) + LD06 2D LiDAR on a bracket, mount unknown to the pipeline."""
+    from scipy.spatial.transform import Rotation
+
+    from cleanscan.synthetic import static_scene
+
+    ses = make_session(tmp_path / "session", n_frames=160, with_depth=False, trajectory="rig",
+                       rig="ld06", color_size=(320, 240), depth_size=(160, 120))
+    rep = run(ses, tmp_path / "out", _cfg("rig", texture_mode="none", rig_stereo=False))
+    assert rep["depth_source"] == "none + external LiDAR"
+
+    # the LiDAR->camera mount is recovered automatically
+    truth = np.array(json.loads((tmp_path / "session" / "truth.json").read_text())["T_camera_lidar"])
+    est = np.array(rep["rig"]["T_camera_lidar"])
+    assert np.degrees(Rotation.from_matrix(truth[:3, :3].T @ est[:3, :3]).magnitude()) < 0.5
+    assert np.linalg.norm(truth[:3, 3] - est[:3, 3]) < 0.01
+
+    # people/animals removed, floor levelled, geometry accurate to ~1 cm
+    person, dog, p = _living_points(tmp_path / "out", "rig")
+    assert person == 0 and dog == 0
+    assert rep["rig"]["readings_dropped"] > 100
+    assert abs(np.median(p[p[:, 2] < 0.1, 2])) < 0.02
+    T = np.array(rep["transform_capture_to_gazebo"])
+    pw = (p - T[:3, 3]) @ T[:3, :3]
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(static_scene()))
+    d = scene.compute_distance(o3d.core.Tensor(pw.astype(np.float32))).numpy()
+    assert np.median(d) < 0.015 and np.percentile(d, 90) < 0.03

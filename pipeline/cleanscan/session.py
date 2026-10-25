@@ -49,6 +49,12 @@ class Frame:
         return np.linalg.inv(self.pose_cv)
 
 
+# High-rate ARKit/ARCore poses (every camera frame, ~60 Hz): f64 time + row-major 4x4 (f32)
+POSE_DTYPE = np.dtype([("t", "<f8"), ("m", "<f4", (16,))])
+# LiDAR readings already converted to the phone clock (see rig/cleanscan_rig/protocol.py)
+LIDAR_DTYPE = np.dtype([("t", "<f8"), ("angle", "<f4"), ("range", "<f4"), ("intensity", "u1")])
+
+
 class Session:
     def __init__(self, root: Path, meta: dict, frames: list[Frame]):
         self.root = root
@@ -56,6 +62,32 @@ class Session:
         self.frames = frames
         self.depth_unit = float(meta.get("depth_unit", 0.001))
         self.confidence_levels = int(meta.get("confidence_levels", 3))
+        self.poses: tuple[np.ndarray, np.ndarray] | None = None  # (t, camera_to_world GL)
+        self.lidar: np.ndarray | None = None  # LIDAR_DTYPE records
+        self.rig: dict = {}
+        self.planes: list[dict] = []
+        self._load_rig()
+
+    def _load_rig(self) -> None:
+        """Optional extras: 60 Hz poses, an external LiDAR (rig) and ARKit planes."""
+        p = self.root / "poses.bin"
+        if p.exists():
+            rec = np.fromfile(p, POSE_DTYPE)
+            if len(rec) >= 2:
+                order = np.argsort(rec["t"])
+                self.poses = (rec["t"][order], rec["m"][order].reshape(-1, 4, 4).astype(np.float64))
+        if (self.root / "rig.json").exists():
+            self.rig = json.loads((self.root / "rig.json").read_text())
+        p = self.root / "lidar.bin"
+        if p.exists():
+            rec = np.fromfile(p, LIDAR_DTYPE)
+            self.lidar = rec[np.argsort(rec["t"], kind="stable")] if len(rec) else None
+        if (self.root / "planes.json").exists():
+            self.planes = json.loads((self.root / "planes.json").read_text())
+
+    @property
+    def has_lidar(self) -> bool:
+        return self.lidar is not None and len(self.lidar) > 0
 
     @classmethod
     def load(cls, root: str | Path) -> "Session":

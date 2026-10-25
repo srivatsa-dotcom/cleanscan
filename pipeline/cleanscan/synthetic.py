@@ -67,12 +67,46 @@ def _pose(theta: float, phi: float, pos) -> np.ndarray:
     return T
 
 
+def trajectory_pose(s: float, trajectory: str) -> np.ndarray:
+    """Camera -> world (OpenGL axes) at scan progress s in [0, 1]."""
+    if trajectory in ("walk", "rig"):
+        a = 2 * np.pi * s
+        theta = np.arctan2(-np.cos(a), -np.sin(a))  # look outwards, at the walls
+        if trajectory == "rig":  # sweep the phone up and down so the LiDAR covers the walls
+            theta += np.radians(15) * np.sin(10 * np.pi * s)
+            phi = np.radians(-15 + 28 * np.sin(14 * np.pi * s))
+        else:
+            phi = np.radians(-20 + 10 * np.sin(4 * np.pi * s))
+        pos = (1.0 * np.cos(a), 1.4, 0.8 * np.sin(a))
+    else:
+        theta = 4 * np.pi * s  # two full turns
+        phi = np.radians(-25 + 15 * np.sin(6 * np.pi * s))
+        pos = (0.4 * np.sin(2 * np.pi * s), 1.4, 0.3 * np.cos(2 * np.pi * s))
+    return _pose(theta, phi, pos)
+
+
+def rig_extrinsic(kind: str) -> np.ndarray:
+    """A realistic LiDAR->camera mount: sensor 7 cm above the camera, scan plane / beam
+    roughly level with the phone's view, off by a few degrees (hand-made bracket)."""
+    # columns = LiDAR axes in camera axes: x -> -z (forward), y -> -x (left), z -> +y (up)
+    R0 = np.stack([[0, 0, -1], [-1, 0, 0], [0, 1, 0]], 1).astype(float)
+    tilt = o3d.geometry.get_rotation_matrix_from_xyz(np.radians([2.0, -1.5, 3.0]))
+    T = np.eye(4)
+    T[:3, :3] = tilt @ R0
+    T[:3, 3] = (0.004, 0.07, 0.012)
+    return T
+
+
 def make_session(out: str | Path, n_frames: int = 160, with_masks: bool = True,
                  color_size=(640, 480), depth_size=(256, 192), noise: float = 0.004,
-                 seed: int = 0, with_depth: bool = True, trajectory: str = "spin") -> Path:
+                 seed: int = 0, with_depth: bool = True, trajectory: str = "spin",
+                 rig: str | None = None, arkit_planes: bool = True) -> Path:
     """``with_depth=False`` imitates a phone without LiDAR/ToF (e.g. iPhone 11).
     ``trajectory``: "spin" turns on the spot (fine with a depth sensor), "walk" walks a
-    loop looking at the walls, which camera-only (stereo) capture needs."""
+    loop looking at the walls, which camera-only (stereo) capture needs, "rig" is the walk
+    with up/down sweeps for a phone + external LiDAR.
+    ``rig``: "ld06" (2D) or "tfluna" (1D) adds an external LiDAR as recorded by the app,
+    with 60 Hz poses, ARKit planes and the true mount in ``truth.json`` (for tests only)."""
     out = Path(out)
     for d in ("color", "depth", "confidence", "mask"):
         (out / d).mkdir(parents=True, exist_ok=True)
@@ -88,16 +122,7 @@ def make_session(out: str | Path, n_frames: int = 160, with_masks: bool = True,
     lines = []
     for i in range(n_frames):
         s = i / max(n_frames - 1, 1)
-        if trajectory == "walk":
-            a = 2 * np.pi * s
-            theta = np.arctan2(-np.cos(a), -np.sin(a))  # look outwards, at the walls
-            phi = np.radians(-20 + 10 * np.sin(4 * np.pi * s))
-            pos = (1.0 * np.cos(a), 1.4, 0.8 * np.sin(a))
-        else:
-            theta = 4 * np.pi * s  # two full turns
-            phi = np.radians(-25 + 15 * np.sin(6 * np.pi * s))
-            pos = (0.4 * np.sin(2 * np.pi * s), 1.4, 0.3 * np.cos(2 * np.pi * s))
-        pose_gl = _pose(theta, phi, pos)
+        pose_gl = trajectory_pose(s, trajectory)
         pose_cv = pose_gl @ GL_TO_CV
 
         scene = o3d.t.geometry.RaycastingScene()
@@ -152,4 +177,69 @@ def make_session(out: str | Path, n_frames: int = 160, with_masks: bool = True,
         "world_up": "y", "camera_convention": "opengl",
         "depth_source": "synthetic" if with_depth else "none",
     }, indent=2))
+    if rig:
+        _simulate_rig(out, rig, n_frames, trajectory, static, rng, arkit_planes)
     return out
+
+
+def _simulate_rig(out: Path, sensor: str, n_frames: int, trajectory: str, static, rng,
+                  arkit_planes: bool) -> None:
+    from .session import LIDAR_DTYPE, POSE_DTYPE
+
+    kind = "1d" if sensor in ("tfluna", "tfmini") else "2d"
+    T_cl = rig_extrinsic(kind)
+    duration = (n_frames - 1) / 10.0  # frames are 10 Hz apart
+
+    t60 = np.arange(0.0, duration, 1 / 60)
+    poses = np.zeros(len(t60), POSE_DTYPE)
+    poses["t"] = t60
+    poses["m"] = [trajectory_pose(t / duration, trajectory).reshape(-1) for t in t60]
+    poses.tofile(out / "poses.bin")
+
+    rate, sigma = (4500.0, 0.012) if kind == "2d" else (100.0, 0.02)
+    recs = []
+    window = 0.1
+    for w0 in np.arange(0.0, duration, window):
+        t = np.arange(np.ceil(w0 * rate), np.ceil(min(w0 + window, duration) * rate)) / rate
+        if len(t) == 0:
+            continue
+        s_mid = (w0 + window / 2) / duration
+        scene = o3d.t.geometry.RaycastingScene()
+        scene.add_triangles(static)
+        scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(person_at(min(s_mid, 1))))
+        scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(dog_at(min(s_mid, 1))))
+        if kind == "2d":
+            ang = (2 * np.pi * 10.0 * t) % (2 * np.pi)  # 10 rev/s, counter-clockwise
+            d_local = np.stack([np.cos(ang), np.sin(ang), np.zeros_like(ang)], -1)
+        else:
+            ang = np.zeros_like(t)
+            d_local = np.tile([1.0, 0.0, 0.0], (len(t), 1))
+        M = np.stack([trajectory_pose(ti / duration, trajectory) @ T_cl for ti in t])
+        origins = M[:, :3, 3]
+        dirs = np.einsum("nij,nj->ni", M[:, :3, :3], d_local)
+        ans = scene.cast_rays(o3d.core.Tensor(np.concatenate([origins, dirs], 1).astype(np.float32)))
+        r = ans["t_hit"].numpy().astype(np.float64)
+        ok = np.isfinite(r) & (r < 12.0) & (rng.random(len(r)) > 0.03)
+        r = np.where(ok, r + sigma * rng.standard_normal(len(r)), 0.0)
+        rec = np.zeros(len(t), LIDAR_DTYPE)
+        rec["t"], rec["angle"], rec["range"] = t, ang, r
+        rec["intensity"] = np.where(ok, 200, 0)
+        recs.append(rec)
+    np.concatenate(recs).tofile(out / "lidar.bin")
+    (out / "rig.json").write_text(json.dumps({"sensor": sensor, "kind": kind}, indent=2))
+    (out / "truth.json").write_text(json.dumps({"T_camera_lidar": T_cl.tolist()}, indent=2))
+
+    if arkit_planes:  # what ARKit typically detects: the floor and two walls, partially
+        def plane(R, center, extent):
+            M = np.eye(4)
+            M[:3, :3] = R
+            M[:3, 3] = center
+            return {"transform": M.reshape(-1).tolist(), "center": [0, 0, 0], "extent": extent}
+
+        g = o3d.geometry.get_rotation_matrix_from_xyz
+        planes = [
+            plane(np.eye(3), (0.0, 0.0, 0.0), [4.0, 0.0, 3.0]),  # floor, normal +y
+            plane(g((np.pi / 2, 0, 0)), (0.0, 1.2, -2.5), [4.0, 0.0, 2.0]),  # back wall, normal +z
+            plane(g((0, 0, np.pi / 2)), (3.0, 1.2, 0.0), [2.0, 0.0, 3.5]),  # right wall, normal -x
+        ]
+        (out / "planes.json").write_text(json.dumps(planes, indent=1))

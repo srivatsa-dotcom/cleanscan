@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import open3d as o3d
 
-from . import gazebo, ghosts, mesh as meshops, occupancy, stereo
+from . import gazebo, ghosts, lidar, mesh as meshops, occupancy, stereo
 from .fusion import FusionConfig, integrate
 from .masks import resegment_session
 from .session import Session
@@ -27,6 +27,9 @@ class PipelineConfig:
     fusion: FusionConfig = field(default_factory=FusionConfig)
     texture: TextureConfig = field(default_factory=TextureConfig)
     stereo: stereo.StereoConfig = field(default_factory=stereo.StereoConfig)
+    lidar: lidar.LidarConfig = field(default_factory=lidar.LidarConfig)
+    # With an external LiDAR on a phone without depth sensor, also fuse camera stereo depth?
+    rig_stereo: bool = True
     texture_mode: str = "photo"  # photo | none
     ghost_removal: bool = True
     ghost_min_votes: int = 3
@@ -63,7 +66,11 @@ def run(session_dir: str | Path, out_dir: str | Path, cfg: PipelineConfig) -> di
              session.meta.get("platform", "?"))
 
     camera_only = not session.has_sensor_depth
-    if camera_only:
+    use_frames = True
+    if camera_only and session.has_lidar and not cfg.rig_stereo and session.rig.get("kind", "2d") == "2d":
+        use_frames = False
+        log.info("external LiDAR only (camera stereo disabled)")
+    elif camera_only:
         log.info("camera-only capture (no LiDAR/ToF): computing depth by multi-view stereo")
         stereo.estimate_session_depth(session, cfg.stereo)
     if cfg.fusion.min_confidence is None:
@@ -71,22 +78,33 @@ def run(session_dir: str | Path, out_dir: str | Path, cfg: PipelineConfig) -> di
 
     masks = resegment_session(session, cfg.resegment_model) if cfg.resegment_model else None
 
+    cloud = lidar.load_cloud(session, cfg.lidar) if session.has_lidar else None
+    views = None
+    if cloud is not None:
+        lidar.mask_living(session, cloud, cfg.lidar, masks)
+        views = lidar.build_views(cloud, cfg.lidar)
+
     log.info("pass 1: fusing with people/animal masks")
-    fused = integrate(session, cfg.fusion, masks=masks)
+    fused = integrate(session, cfg.fusion, masks=masks, views=views, use_frames=use_frames)
     extra, n_ghost = None, 0
     if cfg.ghost_removal and len(fused.triangles):
         extra = {}
         for it in range(cfg.ghost_iterations):
             log.info("ghost check %d: looking for transient objects the masks missed", it + 1)
             combined = _merge_masks(masks, extra)
+            kept = int(cloud.keep.sum()) if cloud is not None else 0
             new, transient = ghosts.detect_ghost_masks(session, fused, cfg.fusion, masks=combined,
-                                                       min_votes=cfg.ghost_min_votes)
-            if not new:
+                                                       min_votes=cfg.ghost_min_votes, cloud=cloud)
+            lidar_changed = cloud is not None and int(cloud.keep.sum()) < kept
+            if not new and not lidar_changed:
                 break
             n_ghost += int(transient.sum())
             extra = _merge_masks(extra, new)
+            if lidar_changed:
+                views = lidar.build_views(cloud, cfg.lidar)
             log.info("re-fusing without %d transient triangles", int(transient.sum()))
-            fused = integrate(session, cfg.fusion, masks=masks, extra_masks=extra)
+            fused = integrate(session, cfg.fusion, masks=masks, extra_masks=extra, views=views,
+                              use_frames=use_frames)
             if transient.sum() < 0.001 * len(transient):
                 break
 
@@ -120,7 +138,13 @@ def run(session_dir: str | Path, out_dir: str | Path, cfg: PipelineConfig) -> di
     report = {
         "name": cfg.name,
         "frames": len(session.frames),
-        "depth_source": "stereo" if camera_only else "sensor",
+        "depth_source": ("sensor" if not camera_only else "stereo" if use_frames else "none")
+                        + (" + external LiDAR" if cloud is not None else ""),
+        "rig": None if cloud is None else {
+            "sensor": session.rig.get("sensor"), "kind": cloud.kind,
+            "readings_used": int(cloud.keep.sum()), "readings_dropped": int((~cloud.keep).sum()),
+            "calibration": cloud.calibration, "T_camera_lidar": cloud.T_cam_lidar.tolist(),
+        },
         "platform": session.meta.get("platform"),
         "triangles_visual": len(aligned.triangles),
         "triangles_collision": len(collision.triangles),

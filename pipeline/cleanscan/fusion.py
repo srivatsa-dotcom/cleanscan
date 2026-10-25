@@ -23,6 +23,27 @@ log = logging.getLogger(__name__)
 
 
 @dataclass
+class DepthView:
+    """A depth image from any source other than the session's camera frames, e.g. a
+    virtual camera built from external-LiDAR rays (see lidar.py). Depth in metres, 0 = none,
+    already free of people/animals."""
+
+    key: str
+    K: np.ndarray
+    pose_cv: np.ndarray  # camera -> world, OpenCV axes
+    depth: np.ndarray
+    max_depth: float = 12.0
+
+    @property
+    def size(self) -> tuple[int, int]:
+        return self.depth.shape[1], self.depth.shape[0]
+
+    @property
+    def extrinsic_cv(self) -> np.ndarray:
+        return np.linalg.inv(self.pose_cv)
+
+
+@dataclass
 class FusionConfig:
     voxel_size: float = 0.02  # metres
     sdf_trunc_voxels: float = 4.0
@@ -83,8 +104,10 @@ def prepare_depth(session: Session, frame: Frame, cfg: FusionConfig,
 
 def integrate(session: Session, cfg: FusionConfig,
               masks: dict[int, np.ndarray] | None = None,
-              extra_masks: dict[int, np.ndarray] | None = None) -> o3d.geometry.TriangleMesh:
-    """Fuse all frames into a coloured triangle mesh (world frame, Y up)."""
+              extra_masks: dict[int, np.ndarray] | None = None,
+              views: list[DepthView] | None = None,
+              use_frames: bool = True) -> o3d.geometry.TriangleMesh:
+    """Fuse all frames (and extra depth views) into a coloured triangle mesh (world, Y up)."""
     o3c = o3d.core
     vbg = o3d.t.geometry.VoxelBlockGrid(
         attr_names=("tsdf", "weight", "color"),
@@ -95,8 +118,9 @@ def integrate(session: Session, cfg: FusionConfig,
         block_count=cfg.block_count,
         device=o3c.Device("CPU:0"),
     )
-    n = len(session.frames)
-    for i, fr in enumerate(session.frames):
+    frames = session.frames if use_frames else []
+    n = len(frames)
+    for i, fr in enumerate(frames):
         depth, _ = prepare_depth(
             session, fr, cfg,
             mask_override=None if masks is None else masks.get(fr.index),
@@ -117,6 +141,24 @@ def integrate(session: Session, cfg: FusionConfig,
         vbg.integrate(blocks, d_img, c_img, K, K, E, 1.0, cfg.max_depth, cfg.sdf_trunc_voxels)
         if (i + 1) % 100 == 0 or i + 1 == n:
             log.info("integrated %d/%d frames", i + 1, n)
+    for v in views or []:
+        if np.count_nonzero(v.depth) < 3:
+            continue
+        w, h = v.size
+        d_img = o3d.t.geometry.Image(o3c.Tensor(np.ascontiguousarray(v.depth, np.float32)))
+        c_img = o3d.t.geometry.Image(o3c.Tensor(np.full((h, w, 3), 0.6, np.float32)))
+        K = o3c.Tensor(v.K)
+        E = o3c.Tensor(v.extrinsic_cv)
+        try:
+            blocks = vbg.compute_unique_block_coordinates(d_img, K, E, 1.0, v.max_depth, cfg.sdf_trunc_voxels)
+        except RuntimeError:  # Open3D raises when no voxel block is touched
+            continue
+        if blocks.shape[0]:
+            vbg.integrate(blocks, d_img, c_img, K, K, E, 1.0, v.max_depth, cfg.sdf_trunc_voxels)
+    if views:
+        log.info("integrated %d LiDAR views", len(views))
+    if vbg.hashmap().size() == 0:
+        return o3d.geometry.TriangleMesh()
     mesh = vbg.extract_triangle_mesh(weight_threshold=cfg.min_weight).to_legacy()
     mesh.compute_vertex_normals()
     return mesh

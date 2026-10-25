@@ -24,6 +24,7 @@ targets:
       properties:
         CFBundleDisplayName: CleanScan
         NSCameraUsageDescription: CleanScan uses the camera (and LiDAR where available) to scan your environment.
+        NSLocalNetworkUsageDescription: CleanScan connects to your LiDAR rig (Raspberry Pi) on the local Wi-Fi.
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         UIRequiredDeviceCapabilities: [arkit]

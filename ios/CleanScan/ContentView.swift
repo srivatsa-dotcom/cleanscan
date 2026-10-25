@@ -17,6 +17,9 @@ struct ContentView: View {
                             Text("\(scan.frameCount) frames · \(String(format: "%.1f", scan.maskedPercent))% living beings masked")
                                 .font(.caption.monospacedDigit())
                         }
+                        if scan.rigEnabled {
+                            RigStatusView(rig: scan.rig, host: scan.rigHost)
+                        }
                         if !scan.hasSegmentationModel {
                             Text("Animal model not bundled - using built-in cat/dog detector")
                                 .font(.caption2).foregroundStyle(.yellow)
@@ -66,7 +69,7 @@ struct ContentView: View {
             }
             .foregroundStyle(.white)
         }
-        .sheet(isPresented: $showLibrary) { LibraryView() }
+        .sheet(isPresented: $showLibrary) { LibraryView(scan: scan) }
     }
 }
 
@@ -82,7 +85,26 @@ struct ARViewContainer: UIViewRepresentable {
     func updateUIView(_ uiView: ARView, context: Context) {}
 }
 
+/// One line on the scan screen: is the LiDAR rig streaming?
+struct RigStatusView: View {
+    @ObservedObject var rig: RigClient
+    let host: String
+
+    var body: some View {
+        if rig.connected {
+            Text("Rig: \(rig.sensor.uppercased()) \(rig.kind) · \(rig.pointsPerSecond) pts/s"
+                 + (rig.rttMs.map { String(format: " · sync %.0f ms", $0) } ?? ""))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(rig.pointsPerSecond > 0 ? .green : .yellow)
+        } else {
+            Text("Rig: looking for \(host) - join the CleanScanRig Wi-Fi")
+                .font(.caption).foregroundStyle(.yellow)
+        }
+    }
+}
+
 struct LibraryView: View {
+    @ObservedObject var scan: ScanController
     @State private var scans: [URL] = ScanLibrary.list()
     @State private var shareItem: ShareItem?
     @State private var zipping: URL?
@@ -91,6 +113,18 @@ struct LibraryView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section(header: Text("External LiDAR rig"),
+                        footer: Text("Raspberry Pi + LD06/LD19 or TF-Luna on the phone (see rig/README.md). " +
+                                     "Join the rig's Wi-Fi first; its address is 10.42.0.1 by default.")) {
+                    Toggle("Use LiDAR rig", isOn: $scan.rigEnabled)
+                    if scan.rigEnabled {
+                        TextField("Rig address", text: $scan.rigHost)
+                            .keyboardType(.numbersAndPunctuation)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        RigStatusView(rig: scan.rig, host: scan.rigHost)
+                    }
+                }
                 Section(footer: Text("Export a scan and process it on your computer:\n" +
                                      "cleanscan process Scan-XXXX.zip -o my_world")) {
                     ForEach(scans, id: \.self) { url in

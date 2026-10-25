@@ -15,6 +15,16 @@ final class ScanController: NSObject, ObservableObject, ARSessionDelegate {
     @Published var showMesh = true { didSet { updateDebugOptions() } }
     let lidarAvailable = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
 
+    /// External LiDAR rig (Raspberry Pi + LD06/TF-Luna on the phone, see rig/).
+    let rig = RigClient()
+    @Published var rigEnabled = UserDefaults.standard.bool(forKey: "rigEnabled") {
+        didSet { UserDefaults.standard.set(rigEnabled, forKey: "rigEnabled"); updateRig() }
+    }
+    @Published var rigHost = UserDefaults.standard.string(forKey: "rigHost") ?? "10.42.0.1" {
+        didSet { UserDefaults.standard.set(rigHost, forKey: "rigHost"); updateRig() }
+    }
+    private var streams: StreamRecorder?
+
     private weak var arView: ARView?
     private var writer: SessionWriter?
     private let masker = LivingBeingMasker()
@@ -36,6 +46,11 @@ final class ScanController: NSObject, ObservableObject, ARSessionDelegate {
         view.session.delegate = self
         view.renderOptions.insert(.disableMotionBlur)
         startSession()
+        updateRig()
+    }
+
+    private func updateRig() {
+        if rigEnabled { rig.start(host: rigHost) } else { rig.stop() }
     }
 
     var cameraOnly: Bool { !lidarAvailable }
@@ -56,6 +71,7 @@ final class ScanController: NSObject, ObservableObject, ARSessionDelegate {
         guard let view = arView else { return }
         let config = ARWorldTrackingConfiguration()
         config.worldAlignment = .gravity
+        config.planeDetection = [.horizontal, .vertical]  // saved with the scan for rig calibration
         if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
             config.sceneReconstruction = .mesh  // live preview only; the final map is fused offline
         }
@@ -91,7 +107,11 @@ final class ScanController: NSObject, ObservableObject, ARSessionDelegate {
 
     private func start() {
         do {
-            writer = try SessionWriter.create(depthSource: cameraOnly ? "none" : "lidar")
+            let w = try SessionWriter.create(depthSource: cameraOnly ? "none" : "lidar")
+            writer = w
+            let s = try StreamRecorder(directory: w.directory)
+            streams = s
+            rig.onReadings = { s.addLidar($0) }
             frameCount = 0
             lastPose = nil
             isRecording = true
@@ -107,20 +127,31 @@ final class ScanController: NSObject, ObservableObject, ARSessionDelegate {
         UIApplication.shared.isIdleTimerDisabled = false
         let w = writer
         writer = nil
+        rig.onReadings = nil
+        let rigInfo: [String: Any]? = rigEnabled ? [
+            "sensor": rig.sensor, "kind": rig.kind, "host": rigHost,
+            "clock_rtt_ms": rig.rttMs ?? -1,
+        ] : nil
+        let planes = arView?.session.currentFrame?.anchors.compactMap { $0 as? ARPlaneAnchor } ?? []
+        let s = streams
+        streams = nil
         queue.async {
             w?.finish()
-            DispatchQueue.main.async { self.status = "Saved \(self.frameCount) frames. Open Scans to export." }
+            let done = { DispatchQueue.main.async { self.status = "Saved \(self.frameCount) frames. Open Scans to export." } }
+            if let s { s.finish(rig: rigInfo, planes: planes, completion: done) } else { done() }
         }
     }
 
     // MARK: ARSessionDelegate
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        guard isRecording, !busy, let writer else { return }
+        guard isRecording else { return }
         guard case .normal = frame.camera.trackingState else {
             status = "Tracking limited - slow down / add light"
             return
         }
+        streams?.addPose(t: frame.timestamp, cameraToWorld: frame.camera.transform)  // every frame (~60 Hz)
+        guard !busy, let writer else { return }
         let depth = frame.sceneDepth
         if !cameraOnly && depth == nil { return }
         let now = frame.timestamp

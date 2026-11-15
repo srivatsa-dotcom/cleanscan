@@ -18,8 +18,8 @@ import numpy as np
 from . import physics
 from .pipeline import PipelineConfig, export_room, reconstruct_room
 from .scene import (Joint, Scene, SceneObject, load_scene, make_link, pose_from_dict,
-                    read_obj_vf, room_collision_boxes, save_scene,
-                    support_heights, support_patch)
+                    carve_room, drop_boxes_in_hulls, object_hulls_world, read_obj_vf, room_collision_boxes,
+                    save_scene, support_heights, support_patch)
 
 log = logging.getLogger(__name__)
 
@@ -30,8 +30,11 @@ class RLConfig:
     materials: str | None = None  # extra materials.yaml merged over the packaged one
     decomposition: str = "auto"  # auto | coacd | vhacd | hull
     max_hulls: int = 16
+    collision_quality: str = "fast"  # fast | best (CoACD presets)
     room_box_voxel: float = 0.04  # MuJoCo room collision boxes
     declared_objects: str | None = None  # JSON file of objects given by hand (see below)
+    objects: str = "auto"  # auto: from the app's selection | none | truth (synthetic tests only)
+    carve_margin: float = 0.02  # m around each object removed from the static room
     zip: bool = True
 
 
@@ -58,7 +61,8 @@ def build_object(scene_dir: Path, obj_id: str, cls: str, type_: str, pose: np.nd
         rel = rel_root if len(links) == 1 else f"{rel_root}/links/{ld['name']}"
         lk, li = make_link(scene_dir, rel, ld["name"], np.asarray(ld["V"]), np.asarray(ld["F"]), spec,
                            colors=ld.get("colors"), textured=ld.get("textured"),
-                           decomposition=cfg.decomposition, max_hulls=cfg.max_hulls)
+                           decomposition=cfg.decomposition, max_hulls=cfg.max_hulls,
+                           quality=cfg.collision_quality)
         built.append(lk)
         link_info[ld["name"]] = li
     js = []
@@ -135,14 +139,25 @@ def process_rl(session_dir: str | Path, scene_dir: str | Path, cfg: RLConfig) ->
 
     room = reconstruct_room(session_dir, pc)
     objects: list[SceneObject] = []
+    if cfg.objects == "truth":
+        from .synthetic_kitchen import objects_from_truth
+
+        objects += objects_from_truth(Path(session_dir), room.T, scene_dir, table, cfg)
     if cfg.declared_objects:
         objects += load_declared_objects(Path(cfg.declared_objects), scene_dir, table, cfg)
 
+    # support heights come from the full room; then the objects are cut out of it
+    heights = support_heights(room.aligned)
+    hulls = [h for o in objects for h in object_hulls_world(o, scene_dir)]
+    # fused surfaces are blurred by about a voxel, so the margin grows with the voxel size
+    margin = max(cfg.carve_margin, 1.5 * pc.fusion.voxel_size)
+    room.aligned, room.textured, n_carved = carve_room(room.aligned, room.textured, hulls, margin)
+    log.info("removed %d room triangles occupied by %d objects", n_carved, len(objects))
+
     room_dir = scene_dir / "room"
     room_report = export_room(room, room_dir, pc)
-    boxes = room_collision_boxes(room.aligned, cfg.room_box_voxel)
+    boxes = drop_boxes_in_hulls(room_collision_boxes(room.aligned, cfg.room_box_voxel), hulls)
     (room_dir / "collision_boxes.json").write_text(json.dumps(boxes))
-    heights = support_heights(room.aligned)
     supports, warnings = [], []
     for o in objects:
         if o.type == "pickable":
@@ -167,7 +182,7 @@ def process_rl(session_dir: str | Path, scene_dir: str | Path, cfg: RLConfig) ->
         "name": name, "units": "m", "up": "z",
         "room": {k: room_report[k] for k in ("frames", "depth_source", "triangles_visual",
                                              "triangles_collision", "ghost_triangles_removed", "extent_m")}
-                | {"collision_boxes": len(boxes)},
+                | {"collision_boxes": len(boxes), "triangles_carved": n_carved},
         "objects": [{"id": o.id, "class": o.cls, "type": o.type,
                      "mass_kg": round(sum(lk.mass for lk in o.links), 4), **o.info} for o in objects],
         "supports": supports,

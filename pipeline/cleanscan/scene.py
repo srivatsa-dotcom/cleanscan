@@ -244,7 +244,8 @@ def write_visual(path: Path, V: np.ndarray, F: np.ndarray, colors: np.ndarray | 
 
 def make_link(scene_dir: Path, rel_dir: str, name: str, V: np.ndarray, F: np.ndarray,
               spec: physics.PhysicsSpec, colors: np.ndarray | None = None, textured=None,
-              decomposition: str = "auto", max_hulls: int = 16) -> tuple[Link, dict]:
+              decomposition: str = "auto", max_hulls: int = 16,
+              quality: str = "fast") -> tuple[Link, dict]:
     """Write a link's visual + convex collision pieces under ``scene_dir/rel_dir`` and
     compute its mass properties. ``V``/``F``: watertight mesh in the object frame.
     Returns (link, info for the report)."""
@@ -252,7 +253,7 @@ def make_link(scene_dir: Path, rel_dir: str, name: str, V: np.ndarray, F: np.nda
     d = scene_dir / rel_dir
     (d / "collision").mkdir(parents=True, exist_ok=True)
     write_visual(d / "visual.obj", V, F, colors, textured)
-    pieces, method = physics.convex_decomposition(V, F, decomposition, max_hulls=max_hulls)
+    pieces, method = physics.convex_decomposition(V, F, decomposition, max_hulls=max_hulls, quality=quality)
     coll = []
     for i, (pv, pf) in enumerate(pieces):
         p = d / "collision" / f"{i:03d}.obj"
@@ -378,3 +379,69 @@ def support_patch(o: SceneObject, scene_dir: Path, heights: np.ndarray, below: f
            "size": _round([hi[0] - lo[0], hi[1] - lo[1], thickness], 5), "top": round(top, 5),
            "object_bottom": round(bottom, 5)}
     return box, warn
+
+
+def _inside_hulls(points: np.ndarray, hulls: list, margin: float) -> np.ndarray:
+    from scipy.spatial import ConvexHull
+
+    inside = np.zeros(len(points), bool)
+    for H in hulls:
+        if len(H) < 4:
+            continue
+        eq = ConvexHull(H).equations  # outward normal . x + offset <= 0 inside
+        lo, hi = H.min(0) - margin, H.max(0) + margin
+        cand = np.nonzero(((points >= lo) & (points <= hi)).all(1) & ~inside)[0]
+        if len(cand):
+            d = points[cand] @ eq[:, :3].T + eq[:, 3]
+            inside[cand[(d <= margin).all(1)]] = True
+    return inside
+
+
+def object_hulls_world(o: SceneObject, scene_dir: Path) -> list[np.ndarray]:
+    return [read_obj_vf(Path(scene_dir) / c)[0] @ o.pose[:3, :3].T + o.pose[:3, 3]
+            for lk in o.links for c in lk.collision]
+
+
+def carve_triangles(V: np.ndarray, F: np.ndarray, hulls: list, margin: float = 0.02) -> np.ndarray:
+    """Mask of triangles to remove: centroid inside a (dilated) hull, or 2+ corners inside."""
+    if not hulls or len(F) == 0:
+        return np.zeros(len(F), bool)
+    cen = V[F].mean(1)
+    vin = _inside_hulls(V, hulls, margin)
+    return _inside_hulls(cen, hulls, margin) | (vin[F].sum(1) >= 2)
+
+
+def carve_room(aligned: o3d.geometry.TriangleMesh, textured, hulls: list, margin: float = 0.02):
+    """Remove the selected objects' volumes from the static room (mesh + textured mesh).
+    Returns (mesh, textured, triangles removed)."""
+    from .texture import TexturedMesh
+
+    V, F = np.asarray(aligned.vertices), np.asarray(aligned.triangles)
+    drop = carve_triangles(V, F, hulls, margin)
+    mesh = copy.deepcopy(aligned)
+    mesh.remove_triangles_by_mask(drop)
+    mesh.remove_unreferenced_vertices()
+    mesh.compute_vertex_normals()
+    if textured is not None:
+        tdrop = carve_triangles(textured.vertices, textured.triangles, hulls, margin)
+        keep = ~tdrop
+        textured = TexturedMesh(textured.vertices, textured.triangles[keep], textured.uvs[keep],
+                                textured.normals, textured.texture)
+    return mesh, textured, int(drop.sum())
+
+
+def drop_boxes_in_hulls(boxes: list[dict], hulls: list, margin: float = 0.005) -> list[dict]:
+    """Remove room collision boxes that reach into an object (leftovers of its scanned
+    surface that carving missed): a box goes if its centre lies within half its smallest
+    size (+ margin) of an object hull."""
+    if not hulls or not boxes:
+        return boxes
+    keep = []
+    for b in boxes:
+        c = np.asarray(b["center"], float)[None]
+        r = 0.5 * min(b["size"]) + margin
+        if not _inside_hulls(c, hulls, r)[0]:
+            keep.append(b)
+    if len(keep) < len(boxes):
+        log.info("dropped %d room boxes overlapping objects", len(boxes) - len(keep))
+    return keep

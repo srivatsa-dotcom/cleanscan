@@ -147,8 +147,13 @@ def export_mjcf(scene: Scene, scene_dir: Path, out_path: Path | None = None) -> 
         world.append(f'    <geom name="support_{_safe(b["object"])}" type="box" pos="{_f(b["center"])}" '
                      f'size="{_f(np.asarray(b["size"]) / 2)}" class="collision" condim="3" '
                      'friction="0.8 0.005 0.0001"/>')
+    excludes = []
     for o in scene.objects:
         world += _object_xml(assets, o)
+        # links of one object never collide with each other (MuJoCo only filters a parent and
+        # child when the parent is not welded to the world); joint limits keep them apart
+        names = [_safe(o.id)] + [f"{_safe(o.id)}_{_safe(o.link(j.child).name)}" for j in o.joints]
+        excludes += [f'    <exclude body1="{a}" body2="{b}"/>' for i, a in enumerate(names) for b in names[i + 1:]]
 
     xml = f"""<?xml version="1.0"?>
 <!-- CleanScan RL scene "{scene.name}". Units: m, kg. Z up, floor at z = 0.
@@ -168,6 +173,9 @@ def export_mjcf(scene: Scene, scene_dir: Path, out_path: Path | None = None) -> 
   <worldbody>
 {chr(10).join(world)}
   </worldbody>
+  <contact>
+{chr(10).join(excludes)}
+  </contact>
 </mujoco>
 """
     out_path.write_text(xml)

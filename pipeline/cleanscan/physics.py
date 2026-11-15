@@ -211,13 +211,43 @@ def convex_hull(V: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return P, F
 
 
-def convex_decomposition(V, F, method: str = "auto", max_hulls: int = 16,
-                         threshold: float = 0.05) -> tuple[list[tuple[np.ndarray, np.ndarray]], str]:
-    """Split a mesh into convex pieces. ``method``: auto | coacd | vhacd | hull.
-    Returns (pieces, method actually used)."""
-    V = np.asarray(V, np.float64)
-    F = np.asarray(F, np.int64)
-    order = ["coacd", "vhacd", "hull"] if method == "auto" else [method, "hull"]
+def connected_parts(V: np.ndarray, F: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Split a mesh into its connected components (shared vertices)."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    n = len(V)
+    e = np.concatenate([F[:, [0, 1]], F[:, [1, 2]]])
+    g = coo_matrix((np.ones(len(e)), (e[:, 0], e[:, 1])), shape=(n, n))
+    k, lab = connected_components(g, directed=False)
+    if k == 1:
+        return [(V, F)]
+    out = []
+    flab = lab[F[:, 0]]
+    for c in range(k):
+        fs = F[flab == c]
+        if len(fs) == 0:
+            continue
+        used = np.unique(fs)
+        remap = -np.ones(n, np.int64)
+        remap[used] = np.arange(len(used))
+        out.append((V[used], remap[fs]))
+    return out
+
+
+COACD_PRESETS = {
+    "fast": {"mcts_iterations": 60, "mcts_max_depth": 2, "preprocess_resolution": 30},
+    "best": {},  # CoACD defaults: slower (tens of seconds for a cupboard), tighter fit
+}
+
+
+def _decompose_one(V, F, order, max_hulls, threshold, quality="fast"):
+    # already convex (boxes, panels, most bottles' bodies)? then its hull is exact
+    vol, _, _ = _solid_integrals(V, F)
+    hv, hf = convex_hull(V)
+    hvol, _, _ = _solid_integrals(hv, hf)
+    if abs(vol) > 0 and abs(hvol - abs(vol)) <= 0.02 * hvol:
+        return [(hv, hf)], "exact"
     for m in order:
         try:
             if m == "coacd":
@@ -225,7 +255,7 @@ def convex_decomposition(V, F, method: str = "auto", max_hulls: int = 16,
 
                 coacd.set_log_level("error")
                 parts = coacd.run_coacd(coacd.Mesh(V, F), threshold=threshold,
-                                        max_convex_hull=max_hulls, seed=0)
+                                        max_convex_hull=max_hulls, seed=0, **COACD_PRESETS[quality])
                 pieces = [convex_hull(np.asarray(p[0])) for p in parts if len(p[0]) >= 4]
             elif m == "vhacd":
                 import vhacdx
@@ -233,11 +263,33 @@ def convex_decomposition(V, F, method: str = "auto", max_hulls: int = 16,
                 parts = vhacdx.compute_vhacd(V, F.astype(np.uint32), maxConvexHulls=max_hulls)
                 pieces = [convex_hull(np.asarray(p[0])) for p in parts if len(p[0]) >= 4]
             else:
-                pieces = [convex_hull(V)]
+                pieces = [(hv, hf)]
             if pieces:
                 return pieces, m
         except ImportError:
             continue
         except Exception as exc:  # noqa: BLE001 - a failing optional backend falls through
             log.warning("convex decomposition with %s failed (%s), trying the next method", m, exc)
-    raise RuntimeError("convex decomposition failed")
+    return [(hv, hf)], "hull"
+
+
+def convex_decomposition(V, F, method: str = "auto", max_hulls: int = 16,
+                         threshold: float = 0.05, quality: str = "fast",
+                         ) -> tuple[list[tuple[np.ndarray, np.ndarray]], str]:
+    """Split a mesh into convex pieces. ``method``: auto | coacd | vhacd | hull.
+    Each connected part is handled on its own (a fridge made of panels stays hollow);
+    parts that are already convex use their exact hull.
+    Returns (pieces, methods used, e.g. "exact+coacd")."""
+    V = np.asarray(V, np.float64)
+    F = np.asarray(F, np.int64)
+    order = ["coacd", "vhacd", "hull"] if method == "auto" else [method, "hull"]
+    pieces, used = [], set()
+    for pv, pf in connected_parts(V, F):
+        if len(np.unique(pf)) < 4:
+            continue
+        p, m = _decompose_one(pv, pf, order, max_hulls, threshold, quality)
+        pieces += p
+        used.add(m)
+    if not pieces:
+        raise RuntimeError("convex decomposition failed: mesh has no volume")
+    return pieces, "+".join(sorted(used))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -100,7 +101,7 @@ _GROUND = """    <model name="floor_collision">
 """
 
 
-def _world(name: str, flavour: str) -> str:
+def _world(name: str, flavour: str, extra: str = "") -> str:
     if flavour == "sim":
         version = "1.9"
         plugins = """    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
@@ -129,7 +130,7 @@ def _world(name: str, flavour: str) -> str:
       <uri>model://{escape(name)}</uri>
       <pose>0 0 0 0 0 0</pose>
     </include>
-  </world>
+{extra}  </world>
 </sdf>
 """
 
@@ -168,3 +169,120 @@ fi
 """)
     script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return {"model": model_dir, "world_classic": classic, "world_sim": sim, "script": script}
+
+
+# --------------------------------------------------------------------------- RL scenes
+
+
+def _vec(v, nd=6) -> str:
+    return " ".join(f"{float(x):.{nd}g}" for x in np.ravel(v))
+
+
+def _sdf_pose(T: np.ndarray) -> str:
+    from scipy.spatial.transform import Rotation
+
+    rpy = Rotation.from_matrix(T[:3, :3]).as_euler("xyz")  # fixed-axis roll, pitch, yaw
+    return _vec(np.concatenate([T[:3, 3], rpy]))
+
+
+def _link_sdf(o, lk, uri_of) -> str:
+    I = np.asarray(lk.inertia)
+    out = [f'    <link name="{escape(lk.name)}">',
+           "      <inertial>",
+           f"        <pose>{_vec(lk.com)} 0 0 0</pose>",
+           f"        <mass>{lk.mass:.6g}</mass>",
+           "        <inertia>"
+           f"<ixx>{I[0, 0]:.6g}</ixx><ixy>{I[0, 1]:.6g}</ixy><ixz>{I[0, 2]:.6g}</ixz>"
+           f"<iyy>{I[1, 1]:.6g}</iyy><iyz>{I[1, 2]:.6g}</iyz><izz>{I[2, 2]:.6g}</izz></inertia>",
+           "      </inertial>"]
+    if lk.visual:
+        out.append(f'      <visual name="visual"><geometry><mesh><uri>{uri_of(lk.visual)}</uri></mesh>'
+                   "</geometry></visual>")
+    for i, c in enumerate(lk.collision):
+        out.append(f'      <collision name="c{i:03d}"><geometry><mesh><uri>{uri_of(c)}</uri></mesh></geometry>'
+                   f"<surface><friction><ode><mu>{lk.friction:.3g}</mu><mu2>{lk.friction:.3g}</mu2></ode>"
+                   f"</friction><bounce><restitution_coefficient>{lk.restitution:.3g}"
+                   "</restitution_coefficient></bounce></surface></collision>")
+    out.append("    </link>")
+    return "\n".join(out)
+
+
+def _object_model_sdf(o, uri_of) -> str:
+    parts = [f'<?xml version="1.0"?>\n<sdf version="1.6">\n  <model name="{escape(o.id)}">']
+    if o.type == "static":
+        parts.append("    <static>true</static>")
+    parts += [_link_sdf(o, lk, uri_of) for lk in o.links]
+    if o.type == "articulated" and o.fixed_base:
+        parts.append(f'    <joint name="fix_to_world" type="fixed"><parent>world</parent>'
+                     f"<child>{escape(o.root.name)}</child></joint>")
+    for j in o.joints:
+        # joint pose is relative to the child link frame (= the object frame here)
+        parts.append(f'    <joint name="{escape(j.name)}" type="{j.type}">'
+                     f"<pose>{_vec(j.origin)} 0 0 0</pose>"
+                     f"<parent>{escape(j.parent)}</parent><child>{escape(j.child)}</child>"
+                     f"<axis><xyz>{_vec(j.axis)}</xyz><limit><lower>{j.lower:.6g}</lower>"
+                     f"<upper>{j.upper:.6g}</upper><effort>{j.effort:.4g}</effort>"
+                     f"<velocity>{j.velocity:.4g}</velocity></limit><dynamics>"
+                     f"<damping>{j.damping:.4g}</damping><friction>{j.friction:.4g}</friction>"
+                     "</dynamics></axis></joint>")
+    parts.append("  </model>\n</sdf>\n")
+    return "\n".join(parts)
+
+
+def export_scene_sdf(scene, scene_dir: Path) -> dict[str, Path]:
+    """Gazebo export of an RL scene: ``export/world.sdf`` (Gazebo Sim), ``export/world.world``
+    (Classic), one model per object in ``export/models/<id>`` and ``export/run_gazebo.sh``.
+    The room model is the one written by ``cleanscan process`` inside ``room/``."""
+    import shutil
+
+    scene_dir = Path(scene_dir)
+    exp = scene_dir / "export"
+    models = exp / "models"
+    models.mkdir(parents=True, exist_ok=True)
+    includes = []
+    for o in scene.objects:
+        mdir = models / o.id
+        if mdir.exists():
+            shutil.rmtree(mdir)
+        src = scene_dir / "objects" / o.id
+        shutil.copytree(src, mdir / "meshes")
+
+        def uri_of(rel, _oid=o.id):
+            inner = Path(rel).relative_to(Path("objects") / _oid)
+            return f"model://{_oid}/meshes/{inner.as_posix()}"
+
+        (mdir / "model.sdf").write_text(_object_model_sdf(o, uri_of))
+        (mdir / "model.config").write_text(_model_config(o.id).replace(
+            "Static environment scanned with CleanScan (people and animals removed).",
+            f"{o.type} object '{o.name or o.cls}' scanned with CleanScan."))
+        includes.append(f"    <include>\n      <uri>model://{escape(o.id)}</uri>\n      <name>{escape(o.id)}</name>\n"
+                        f"      <pose>{_sdf_pose(o.pose)}</pose>\n    </include>\n")
+    sup = scene.room.get("supports", [])
+    if sup:  # patches under pickables (see scene.support_patch), invisible static boxes
+        cols = "".join(f'        <collision name="{escape(b["object"])}"><pose>{_vec(b["center"])} 0 0 0</pose>'
+                       f'<geometry><box><size>{_vec(b["size"])}</size></box></geometry></collision>\n'
+                       for b in sup)
+        includes.append(f'    <model name="supports">\n      <static>true</static>\n      <link name="link">\n'
+                        f"{cols}      </link>\n    </model>\n")
+    room_name = scene.room.get("name", scene.name)
+    sim = exp / "world.sdf"
+    classic = exp / "world.world"
+    sim.write_text(_world(room_name, "sim", "".join(includes)))
+    classic.write_text(_world(room_name, "classic", "".join(includes)))
+    room_models = os.path.relpath(scene_dir / scene.room.get("models_dir", "room/models"), exp)
+    script = exp / "run_gazebo.sh"
+    script.write_text(f"""#!/usr/bin/env bash
+# Usage: ./run_gazebo.sh [sim|classic]   (default: sim = Gazebo Harmonic/Ionic/Jetty)
+set -euo pipefail
+HERE="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
+P="$HERE/models:$HERE/{room_models}"
+export GZ_SIM_RESOURCE_PATH="$P${{GZ_SIM_RESOURCE_PATH:+:$GZ_SIM_RESOURCE_PATH}}"
+export GAZEBO_MODEL_PATH="$P${{GAZEBO_MODEL_PATH:+:$GAZEBO_MODEL_PATH}}"
+if [ "${{1:-sim}}" = "classic" ]; then
+  exec gazebo --verbose "$HERE/world.world"
+else
+  exec gz sim -v 3 "$HERE/world.sdf"
+fi
+""")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return {"world_sim": sim, "world_classic": classic, "models": models, "script": script}

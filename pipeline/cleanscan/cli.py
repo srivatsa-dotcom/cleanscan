@@ -27,14 +27,7 @@ def _unpack(path: Path) -> Path:
     return inner[0].parent if inner else dest
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="cleanscan", description=__doc__)
-    sub = ap.add_subparsers(dest="cmd", required=True)
-
-    p = sub.add_parser("process", help="session -> clean mesh, Gazebo world, nav map")
-    p.add_argument("session", type=Path, help="capture folder or .zip exported by the app")
-    p.add_argument("-o", "--out", type=Path, required=True)
-    p.add_argument("--name", default=None, help="Gazebo model name (default: folder name)")
+def _add_process_args(p) -> None:
     p.add_argument("--voxel", type=float, default=0.02, help="TSDF voxel size in m (0.01 = finer, slower)")
     p.add_argument("--max-depth", type=float, default=5.0)
     p.add_argument("--min-confidence", type=float, default=None,
@@ -52,6 +45,49 @@ def main(argv=None) -> int:
     p.add_argument("--no-center", action="store_true", help="keep the capture origin instead of centering")
     p.add_argument("--rig-no-stereo", action="store_true",
                    help="LiDAR-rig scans: fuse only the external LiDAR, skip camera stereo (faster)")
+
+
+def _pipeline_cfg(a, name: str) -> PipelineConfig:
+    return PipelineConfig(
+        name=name,
+        fusion=FusionConfig(voxel_size=a.voxel, max_depth=a.max_depth,
+                            min_confidence=a.min_confidence, mask_dilate_px=a.mask_dilate),
+        texture=TextureConfig(size=a.texture_size),
+        texture_mode=a.texture,
+        ghost_removal=not a.no_ghost_removal,
+        resegment_model=a.resegment,
+        hole_size=a.hole_size,
+        map_resolution=a.map_resolution,
+        map_obstacle_max_z=a.robot_height,
+        center_xy=not a.no_center,
+        rig_stereo=not a.rig_no_stereo,
+    )
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="cleanscan", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("process", help="session -> clean mesh, Gazebo world, nav map")
+    p.add_argument("session", type=Path, help="capture folder or .zip exported by the app")
+    p.add_argument("-o", "--out", type=Path, required=True)
+    p.add_argument("--name", default=None, help="Gazebo model name (default: folder name)")
+    _add_process_args(p)
+
+    r = sub.add_parser("process-rl", help="session -> RL scene bundle (USD, MJCF, SDF) with interactive objects")
+    r.add_argument("session", type=Path, help="capture folder or .zip exported by the app")
+    r.add_argument("-o", "--out", type=Path, required=True, help="scene folder (a .zip is written next to it)")
+    r.add_argument("--name", default=None, help="scene/room name (default: folder name)")
+    _add_process_args(r)
+    r.add_argument("--materials", default=None, help="extra materials.yaml merged over the defaults")
+    r.add_argument("--decomposition", choices=["auto", "coacd", "vhacd", "hull"], default="auto",
+                   help="convex decomposition for object collision (auto: CoACD, V-HACD, then hull)")
+    r.add_argument("--objects", default=None, metavar="JSON",
+                   help="add objects given by hand (meshes + poses), see cleanscan/rl.py")
+    r.add_argument("--no-zip", action="store_true")
+
+    e = sub.add_parser("export", help="re-write USD/MJCF/SDF from an edited scene.json")
+    e.add_argument("scene", type=Path)
 
     s = sub.add_parser("synth", help="write a synthetic demo session (room + walking person + dog)")
     s.add_argument("out", type=Path)
@@ -75,6 +111,12 @@ def main(argv=None) -> int:
                            with_depth=not a.no_depth, trajectory=traj))
         return 0
 
+    if a.cmd == "export":
+        from .rl import export_all
+
+        print(json.dumps(export_all(a.scene), indent=2))
+        return 0
+
     session_dir = _unpack(a.session)
     if a.cmd == "inspect":
         ses = Session.load(session_dir)
@@ -85,21 +127,17 @@ def main(argv=None) -> int:
                           "depth_size": ses.frames[0].depth_size}, indent=2))
         return 0
 
-    name = a.name or session_dir.name.replace(" ", "_")
-    cfg = PipelineConfig(
-        name=name,
-        fusion=FusionConfig(voxel_size=a.voxel, max_depth=a.max_depth,
-                            min_confidence=a.min_confidence, mask_dilate_px=a.mask_dilate),
-        texture=TextureConfig(size=a.texture_size),
-        texture_mode=a.texture,
-        ghost_removal=not a.no_ghost_removal,
-        resegment_model=a.resegment,
-        hole_size=a.hole_size,
-        map_resolution=a.map_resolution,
-        map_obstacle_max_z=a.robot_height,
-        center_xy=not a.no_center,
-        rig_stereo=not a.rig_no_stereo,
-    )
+    name = a.name or (a.out.name if a.cmd == "process-rl" else session_dir.name).replace(" ", "_")
+    cfg = _pipeline_cfg(a, name)
+    if a.cmd == "process-rl":
+        from .rl import RLConfig, process_rl
+
+        rep = process_rl(session_dir, a.out, RLConfig(pipeline=cfg, materials=a.materials,
+                                                      decomposition=a.decomposition,
+                                                      declared_objects=a.objects, zip=not a.no_zip))
+        print(json.dumps({k: rep[k] for k in ("name", "room", "objects", "outputs", "seconds")},
+                         indent=2, default=str))
+        return 0
     report = run(session_dir, a.out, cfg)
     print(json.dumps({k: report[k] for k in ("name", "frames", "triangles_visual",
                                              "ghost_triangles_removed", "extent_m", "outputs")}, indent=2))

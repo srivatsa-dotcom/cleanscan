@@ -1,0 +1,183 @@
+"""`cleanscan process-rl`: a capture session -> RL scene bundle (see docs/RL_SCENES_PLAN.md).
+
+    <scene>/scene.json  room/  objects/<id>/  export/{scene.usda, scene.xml, world.sdf}  report.json
+    <scene>.zip
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import shutil
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+import numpy as np
+
+from . import physics
+from .pipeline import PipelineConfig, export_room, reconstruct_room
+from .scene import (Joint, Scene, SceneObject, load_scene, make_link, pose_from_dict,
+                    read_obj_vf, room_collision_boxes, save_scene,
+                    support_heights, support_patch)
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class RLConfig:
+    pipeline: PipelineConfig = field(default_factory=PipelineConfig)
+    materials: str | None = None  # extra materials.yaml merged over the packaged one
+    decomposition: str = "auto"  # auto | coacd | vhacd | hull
+    max_hulls: int = 16
+    room_box_voxel: float = 0.04  # MuJoCo room collision boxes
+    declared_objects: str | None = None  # JSON file of objects given by hand (see below)
+    zip: bool = True
+
+
+# --------------------------------------------------------------------------- objects
+
+
+def build_object(scene_dir: Path, obj_id: str, cls: str, type_: str, pose: np.ndarray,
+                 links: list[dict], joints: list[dict] | None = None, table: dict | None = None,
+                 cfg: RLConfig | None = None, name: str | None = None, fixed_base: bool | None = None,
+                 info: dict | None = None) -> SceneObject:
+    """Create an object from meshes in its own frame.
+
+    ``links``: [{"name", "V", "F", optional "colors", "textured", "physics": {overrides}}],
+    root first. ``joints``: [{"name", "type", "parent", "child", "axis", "origin", "lower",
+    "upper", ...}] in the object frame."""
+    cfg = cfg or RLConfig()
+    table = table or physics.load_materials(cfg.materials)
+    rel_root = f"objects/{obj_id}"
+    if (scene_dir / rel_root).exists():
+        shutil.rmtree(scene_dir / rel_root)
+    built, link_info = [], {}
+    for i, ld in enumerate(links):
+        spec = physics.resolve(ld.get("class", cls), table, ld.get("physics"))
+        rel = rel_root if len(links) == 1 else f"{rel_root}/links/{ld['name']}"
+        lk, li = make_link(scene_dir, rel, ld["name"], np.asarray(ld["V"]), np.asarray(ld["F"]), spec,
+                           colors=ld.get("colors"), textured=ld.get("textured"),
+                           decomposition=cfg.decomposition, max_hulls=cfg.max_hulls)
+        built.append(lk)
+        link_info[ld["name"]] = li
+    js = []
+    for jd in joints or []:
+        axis = np.asarray(jd["axis"], float)
+        js.append(Joint(**{**jd, "axis": (axis / np.linalg.norm(axis)).tolist(),
+                           "origin": list(map(float, jd["origin"]))}))
+        if js[-1].type not in ("revolute", "prismatic"):
+            raise ValueError(f"{obj_id}: joint type must be revolute or prismatic")
+    if fixed_base is None:
+        fixed_base = type_ == "articulated"
+    return SceneObject(id=obj_id, cls=cls, type=type_, pose=np.asarray(pose, float), links=built,
+                       joints=js, name=name, fixed_base=fixed_base,
+                       info={**(info or {}), "links": link_info})
+
+
+def load_declared_objects(path: Path, scene_dir: Path, table: dict, cfg: RLConfig) -> list[SceneObject]:
+    """Objects described by hand (meshes in their own frame + pose), e.g.::
+
+        {"objects": [
+          {"id": "bottle_1", "class": "bottle", "type": "pickable", "mesh": "bottle.obj",
+           "pose": {"position": [1.2, 0.5, 0.9], "quaternion": [1, 0, 0, 0]}},
+          {"id": "cupboard_1", "class": "cupboard", "type": "articulated",
+           "pose": {...}, "links": [{"name": "body", "mesh": "body.obj"},
+                                     {"name": "door", "mesh": "door.obj"}],
+           "joints": [{"name": "hinge", "type": "revolute", "parent": "body", "child": "door",
+                       "axis": [0, 0, 1], "origin": [0.3, -0.2, 0], "lower": 0, "upper": 1.6}]}]}
+
+    Mesh paths are relative to the JSON file. Meshes must be closed for solid objects."""
+    path = Path(path)
+    d = json.loads(path.read_text())
+    out = []
+    for od in d["objects"]:
+        link_defs = od.get("links") or [{"name": "base", "mesh": od["mesh"]}]
+        links = []
+        for ld in link_defs:
+            V, F = read_obj_vf(path.parent / ld["mesh"])
+            links.append({"name": ld["name"], "V": V, "F": F, "physics": ld.get("physics")})
+        out.append(build_object(scene_dir, od["id"], od["class"], od.get("type", "pickable"),
+                                pose_from_dict(od.get("pose", {})), links, od.get("joints"), table, cfg,
+                                name=od.get("name"), fixed_base=od.get("fixed_base"),
+                                info={"source": "declared"}))
+    return out
+
+
+# --------------------------------------------------------------------------- export
+
+
+def export_all(scene_dir: Path) -> dict[str, str]:
+    """(Re-)write every simulator file from ``scene.json`` (with the user's overrides)."""
+    from . import export_isaaclab, export_mjcf, export_usd, gazebo
+
+    scene_dir = Path(scene_dir)
+    scene = load_scene(scene_dir)
+    files = {"mjcf": export_mjcf.export_mjcf(scene, scene_dir),
+             "usd": export_usd.export_usd(scene, scene_dir)}
+    files.update(gazebo.export_scene_sdf(scene, scene_dir))
+    files["isaaclab"] = export_isaaclab.write_example(scene, scene_dir)
+    return {k: str(Path(v).relative_to(scene_dir)) for k, v in files.items()}
+
+
+def zip_scene(scene_dir: Path) -> Path:
+    scene_dir = Path(scene_dir)
+    return Path(shutil.make_archive(str(scene_dir), "zip", scene_dir.parent, scene_dir.name))
+
+
+def process_rl(session_dir: str | Path, scene_dir: str | Path, cfg: RLConfig) -> dict:
+    t0 = time.time()
+    scene_dir = Path(scene_dir)
+    scene_dir.mkdir(parents=True, exist_ok=True)
+    table = physics.load_materials(cfg.materials)
+    pc = cfg.pipeline
+    name = pc.name
+
+    room = reconstruct_room(session_dir, pc)
+    objects: list[SceneObject] = []
+    if cfg.declared_objects:
+        objects += load_declared_objects(Path(cfg.declared_objects), scene_dir, table, cfg)
+
+    room_dir = scene_dir / "room"
+    room_report = export_room(room, room_dir, pc)
+    boxes = room_collision_boxes(room.aligned, cfg.room_box_voxel)
+    (room_dir / "collision_boxes.json").write_text(json.dumps(boxes))
+    heights = support_heights(room.aligned)
+    supports, warnings = [], []
+    for o in objects:
+        if o.type == "pickable":
+            box, warn = support_patch(o, scene_dir, heights)
+            supports.append(box)
+            if warn:
+                warnings.append(warn)
+    rel_model = f"room/models/{name}"
+    scene = Scene(
+        name=name,
+        room={"name": name, "models_dir": "room/models",
+              "visual": f"{rel_model}/meshes/visual.obj", "collision": f"{rel_model}/meshes/collision.stl",
+              "collision_boxes": "room/collision_boxes.json", "map": f"room/maps/{name}.yaml",
+              "supports": supports, "support_heights": [round(float(h), 4) for h in heights],
+              "mesh_ply": f"room/{name}_mesh.ply", "transform_capture_to_scene": room.T.tolist()},
+        objects=objects,
+        info={"session": str(session_dir), "generator": "cleanscan process-rl"})
+    save_scene(scene, scene_dir)
+    files = export_all(scene_dir)
+
+    report = {
+        "name": name, "units": "m", "up": "z",
+        "room": {k: room_report[k] for k in ("frames", "depth_source", "triangles_visual",
+                                             "triangles_collision", "ghost_triangles_removed", "extent_m")}
+                | {"collision_boxes": len(boxes)},
+        "objects": [{"id": o.id, "class": o.cls, "type": o.type,
+                     "mass_kg": round(sum(lk.mass for lk in o.links), 4), **o.info} for o in objects],
+        "supports": supports,
+        "warnings": warnings,
+        "outputs": files,
+        "seconds": round(time.time() - t0, 1),
+        "config": asdict(cfg),
+    }
+    (scene_dir / "report.json").write_text(json.dumps(report, indent=2, default=str))
+    if cfg.zip:
+        report["zip"] = str(zip_scene(scene_dir))
+    log.info("RL scene ready in %.1fs -> %s", report["seconds"], scene_dir)
+    return report

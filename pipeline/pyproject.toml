@@ -5,22 +5,30 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cleanscan"
 version = "0.1.0"
-description = "Turn CleanScan phone captures into people/animal-free meshes, Gazebo worlds and nav maps"
+description = "Turn CleanScan phone captures into people/animal-free meshes, Gazebo worlds, nav maps and RL scenes (USD, MJCF, SDF)"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
     "open3d>=0.18",
     "opencv-python-headless>=4.8",
     "scipy>=1.10",
+    "pyyaml>=6",
 ]
 
 [project.optional-dependencies]
 # Stronger desktop re-segmentation of people/animals (YOLO-seg).
-seg = ["ultralytics>=8.1"]
-dev = ["pytest>=7"]
+seg = ["ultralytics>=8.1"]  # AGPL-3.0, see LICENSES.md
+# RL scenes: MuJoCo validation + USD checks
+sim = ["mujoco>=3.1", "usd-core>=24.0"]
+# better collision shapes than a single convex hull (both optional)
+collision = ["coacd>=1.0", "vhacdx>=0.0.8"]
+dev = ["pytest>=7", "mujoco>=3.1", "usd-core>=24.0"]
 
 [project.scripts]
 cleanscan = "cleanscan.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["cleanscan*"]
+
+[tool.setuptools.package-data]
+cleanscan = ["data/*.yaml"]

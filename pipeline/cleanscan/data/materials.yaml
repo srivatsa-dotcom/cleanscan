@@ -1,0 +1,47 @@
+# CleanScan physics defaults: class -> material -> density / friction.
+# Override with `cleanscan process-rl ... --materials my_materials.yaml` (merged on top of this
+# file) or per object in scene.json ("overrides"), then run `cleanscan export <scene>`.
+#
+# density: kg/m^3   friction: Coulomb coefficient (static ~ dynamic here)
+# hollow objects: mass = density * surface area * shell_thickness (+ optional liquid fill)
+
+materials:
+  glass:    {density: 2500, friction: 0.4, restitution: 0.1}
+  ceramic:  {density: 2400, friction: 0.5, restitution: 0.1}
+  steel:    {density: 7850, friction: 0.4, restitution: 0.1}
+  aluminium: {density: 2700, friction: 0.4, restitution: 0.1}
+  plastic:  {density: 1000, friction: 0.5, restitution: 0.2}
+  pet:      {density: 1380, friction: 0.5, restitution: 0.2}
+  wood:     {density: 600,  friction: 0.6, restitution: 0.1}
+  laminate: {density: 700,  friction: 0.6, restitution: 0.1}
+  cardboard: {density: 700, friction: 0.6, restitution: 0.05}
+  rubber:   {density: 1100, friction: 0.9, restitution: 0.5}
+  generic:  {density: 800,  friction: 0.5, restitution: 0.1}
+
+# fill: fraction of the inner volume filled with water (0 = empty)
+classes:
+  bottle:          {material: pet,      hollow: true, shell_thickness: 0.0008, fill: 0.0}
+  wine glass:      {material: glass,    hollow: true, shell_thickness: 0.0015}
+  glass:           {material: glass,    hollow: true, shell_thickness: 0.0025}
+  tumbler:         {material: glass,    hollow: true, shell_thickness: 0.0025}
+  steel tumbler:   {material: steel,    hollow: true, shell_thickness: 0.0006}
+  cup:             {material: ceramic,  hollow: true, shell_thickness: 0.004}
+  mug:             {material: ceramic,  hollow: true, shell_thickness: 0.004}
+  bowl:            {material: ceramic,  hollow: true, shell_thickness: 0.004}
+  box:             {material: cardboard, hollow: true, shell_thickness: 0.003}
+  book:            {material: cardboard, hollow: false}
+  fork:            {material: steel,    hollow: false}
+  knife:           {material: steel,    hollow: false}
+  spoon:           {material: steel,    hollow: false}
+  pressure cooker: {material: aluminium, hollow: true, shell_thickness: 0.003}
+  refrigerator:    {material: steel,    hollow: true, shell_thickness: 0.002}
+  fridge:          {material: steel,    hollow: true, shell_thickness: 0.002}
+  cupboard:        {material: laminate, hollow: true, shell_thickness: 0.016}
+  cabinet:         {material: laminate, hollow: true, shell_thickness: 0.016}
+  drawer:          {material: laminate, hollow: true, shell_thickness: 0.012}
+  oven:            {material: steel,    hollow: true, shell_thickness: 0.002}
+  microwave:       {material: steel,    hollow: true, shell_thickness: 0.0015}
+  door:            {material: wood,     hollow: true, shell_thickness: 0.006}
+  dishwasher:      {material: steel,    hollow: true, shell_thickness: 0.002}
+
+default: {material: generic, hollow: false}

@@ -16,17 +16,15 @@ from cleanscan.fusion import FusionConfig
 from cleanscan.pipeline import PipelineConfig
 from cleanscan.rl import RLConfig, export_all, process_rl
 from cleanscan.session import Session
-from cleanscan.synthetic_kitchen import make_kitchen_session
 from cleanscan.validate import validate
 
 pytest.importorskip("mujoco")
 
 
 @pytest.fixture(scope="module")
-def kitchen(tmp_path_factory):
+def kitchen(tmp_path_factory, kitchen_session):
     root = tmp_path_factory.mktemp("kitchen")
-    ses = make_kitchen_session(root / "session", room_frames=100, capture_frames=12,
-                               color_size=(320, 240), depth_size=(160, 120))
+    ses = kitchen_session
     cfg = RLConfig(pipeline=PipelineConfig(name="kitchen", texture_mode="none",
                                            fusion=FusionConfig(voxel_size=0.03)),
                    objects="truth", zip=False)

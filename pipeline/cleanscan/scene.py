@@ -138,7 +138,7 @@ def save_scene(scene: Scene, scene_dir: Path) -> Path:
 def _json_default(o):
     if isinstance(o, np.ndarray):
         return o.tolist()
-    if isinstance(o, (np.floating, np.integer)):
+    if isinstance(o, (np.floating, np.integer, np.bool_)):
         return o.item()
     raise TypeError(type(o))
 

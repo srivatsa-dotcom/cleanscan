@@ -24,6 +24,12 @@ from .scene import (Joint, Scene, SceneObject, load_scene, make_link, pose_from_
 log = logging.getLogger(__name__)
 
 
+def _pickable_cfg():
+    from .pickable import PickableConfig
+
+    return PickableConfig()
+
+
 @dataclass
 class RLConfig:
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
@@ -31,6 +37,7 @@ class RLConfig:
     decomposition: str = "auto"  # auto | coacd | vhacd | hull
     max_hulls: int = 16
     collision_quality: str = "fast"  # fast | best (CoACD presets)
+    pickable: "PickableConfig" = field(default_factory=lambda: _pickable_cfg())
     room_box_voxel: float = 0.04  # MuJoCo room collision boxes
     declared_objects: str | None = None  # JSON file of objects given by hand (see below)
     objects: str = "auto"  # auto: from the app's selection | none | truth (synthetic tests only)
@@ -108,6 +115,57 @@ def load_declared_objects(path: Path, scene_dir: Path, table: dict, cfg: RLConfi
     return out
 
 
+def objects_from_selection(session_dir: Path, room, scene_dir: Path, table: dict, cfg: RLConfig,
+                           heights: np.ndarray, warnings: list[str]) -> list[SceneObject]:
+    """The objects the user selected in the app, reconstructed from their guided captures."""
+    from . import objects as objmod
+    from . import pickable
+    from .session import Session
+
+    selected = objmod.load_selection(session_dir)
+    if not selected:
+        return []
+    objmod.locate_objects(room.session, selected, np.asarray(room.aligned.vertices), room.T)
+    out = []
+    for s in selected:
+        info = {"source": s.source, "mode": s.mode, "selection_id": s.id, **s.info}
+        if s.mode != "pickable":
+            warnings.append(f"{s.slug}: {s.mode} objects are not supported yet; left in the static room")
+            continue
+        cap = s.captures.get("scan")
+        cap_dir = Path(session_dir) / cap if cap else None
+        textured = None
+        if cap_dir is not None and (cap_dir / "session.json").exists():
+            try:
+                res = pickable.reconstruct_pickable(Session.load(cap_dir), cfg.pickable)
+                V, F, textured = res.V, res.F, res.textured
+                info["reconstruction"] = res.info
+            except Exception as exc:  # noqa: BLE001 - fall back to the room-pass shape
+                warnings.append(f"{s.slug}: capture could not be reconstructed ({exc})")
+                V = None
+        else:
+            V = None
+            warnings.append(f"{s.slug}: no object capture; using a primitive from the room scan")
+        if s.region is None or len(s.region) < 10:
+            warnings.append(f"{s.slug}: not found in the room scan, cannot be placed; skipped")
+            continue
+        if V is None:
+            V, F, pose = pickable.fallback_primitive(s.region, s.cls, heights)
+            info["shape"] = "primitive"
+        else:
+            pose, reg = pickable.register_to_room(V, F, s.region, heights)
+            info["registration"] = reg
+            info["shape"] = "scanned"
+        pose, dz = pickable.settle(pose, V, heights)
+        info["settle_dz_m"] = round(dz, 4)
+        if abs(dz) > 0.015:
+            warnings.append(f"{s.slug}: moved {dz * 100:.1f} cm vertically onto its support; check the registration")
+        out.append(build_object(scene_dir, s.slug, s.cls, "pickable", pose,
+                                [{"name": "base", "V": V, "F": F, "textured": textured}], None, table, cfg,
+                                name=s.name, info=info))
+    return out
+
+
 # --------------------------------------------------------------------------- export
 
 
@@ -139,15 +197,18 @@ def process_rl(session_dir: str | Path, scene_dir: str | Path, cfg: RLConfig) ->
 
     room = reconstruct_room(session_dir, pc)
     objects: list[SceneObject] = []
-    if cfg.objects == "truth":
+    heights = support_heights(room.aligned)
+    warnings: list[str] = []
+    if cfg.objects == "auto":
+        objects += objects_from_selection(Path(session_dir), room, scene_dir, table, cfg, heights, warnings)
+    elif cfg.objects == "truth":
         from .synthetic_kitchen import objects_from_truth
 
         objects += objects_from_truth(Path(session_dir), room.T, scene_dir, table, cfg)
     if cfg.declared_objects:
         objects += load_declared_objects(Path(cfg.declared_objects), scene_dir, table, cfg)
 
-    # support heights come from the full room; then the objects are cut out of it
-    heights = support_heights(room.aligned)
+    # support heights come from the full room (above); then the objects are cut out of it
     hulls = [h for o in objects for h in object_hulls_world(o, scene_dir)]
     # fused surfaces are blurred by about a voxel, so the margin grows with the voxel size
     margin = max(cfg.carve_margin, 1.5 * pc.fusion.voxel_size)
@@ -158,7 +219,7 @@ def process_rl(session_dir: str | Path, scene_dir: str | Path, cfg: RLConfig) ->
     room_report = export_room(room, room_dir, pc)
     boxes = drop_boxes_in_hulls(room_collision_boxes(room.aligned, cfg.room_box_voxel), hulls)
     (room_dir / "collision_boxes.json").write_text(json.dumps(boxes))
-    supports, warnings = [], []
+    supports = []
     for o in objects:
         if o.type == "pickable":
             box, warn = support_patch(o, scene_dir, heights)
@@ -191,7 +252,10 @@ def process_rl(session_dir: str | Path, scene_dir: str | Path, cfg: RLConfig) ->
         "seconds": round(time.time() - t0, 1),
         "config": asdict(cfg),
     }
-    (scene_dir / "report.json").write_text(json.dumps(report, indent=2, default=str))
+    from .scene import _json_default
+
+    (scene_dir / "report.json").write_text(json.dumps(report, indent=2, default=lambda o: _json_default(o)
+                                                      if isinstance(o, (np.ndarray, np.generic)) else str(o)))
     if cfg.zip:
         report["zip"] = str(zip_scene(scene_dir))
     log.info("RL scene ready in %.1fs -> %s", report["seconds"], scene_dir)

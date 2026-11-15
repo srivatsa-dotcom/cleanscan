@@ -13,6 +13,7 @@ dependencies = [
     "opencv-python-headless>=4.8",
     "scipy>=1.10",
     "pyyaml>=6",
+    "scikit-image>=0.21",  # marching cubes for watertight object meshes
 ]
 
 [project.optional-dependencies]

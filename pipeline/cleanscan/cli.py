@@ -82,12 +82,26 @@ def main(argv=None) -> int:
     r.add_argument("--materials", default=None, help="extra materials.yaml merged over the defaults")
     r.add_argument("--decomposition", choices=["auto", "coacd", "vhacd", "hull"], default="auto",
                    help="convex decomposition for object collision (auto: CoACD, V-HACD, then hull)")
+    r.add_argument("--collision-quality", choices=["fast", "best"], default="fast",
+                   help="CoACD effort: best fits tighter but takes tens of seconds per object")
     r.add_argument("--objects", default=None, metavar="JSON",
                    help="add objects given by hand (meshes + poses), see cleanscan/rl.py")
     r.add_argument("--no-zip", action="store_true")
 
+    r.add_argument("--from-truth", action="store_true",
+                   help="synthetic sessions only: build the objects from truth.json (debugging)")
+
     e = sub.add_parser("export", help="re-write USD/MJCF/SDF from an edited scene.json")
     e.add_argument("scene", type=Path)
+
+    v = sub.add_parser("validate", help="simulate the scene in MuJoCo (and check the USD); exit 1 on failure")
+    v.add_argument("scene", type=Path)
+    v.add_argument("--duration", type=float, default=5.0)
+
+    k = sub.add_parser("synth-kitchen", help="write a synthetic kitchen session (objects, captures, person)")
+    k.add_argument("out", type=Path)
+    k.add_argument("--frames", type=int, default=140, help="room pass frames")
+    k.add_argument("--capture-frames", type=int, default=40, help="frames per object capture")
 
     s = sub.add_parser("synth", help="write a synthetic demo session (room + walking person + dog)")
     s.add_argument("out", type=Path)
@@ -110,6 +124,19 @@ def main(argv=None) -> int:
         print(make_session(a.out, n_frames=a.frames, with_masks=not a.no_masks,
                            with_depth=not a.no_depth, trajectory=traj))
         return 0
+
+    if a.cmd == "synth-kitchen":
+        from .synthetic_kitchen import make_kitchen_session
+
+        print(make_kitchen_session(a.out, room_frames=a.frames, capture_frames=a.capture_frames))
+        return 0
+
+    if a.cmd == "validate":
+        from .validate import ValidationConfig, validate
+
+        res = validate(a.scene, ValidationConfig(duration=a.duration))
+        print(json.dumps(res, indent=2))
+        return 0 if res["ok"] else 1
 
     if a.cmd == "export":
         from .rl import export_all
@@ -134,7 +161,9 @@ def main(argv=None) -> int:
 
         rep = process_rl(session_dir, a.out, RLConfig(pipeline=cfg, materials=a.materials,
                                                       decomposition=a.decomposition,
-                                                      declared_objects=a.objects, zip=not a.no_zip))
+                                                      collision_quality=a.collision_quality,
+                                                      declared_objects=a.objects, zip=not a.no_zip,
+                                                      objects="truth" if a.from_truth else "auto"))
         print(json.dumps({k: rep[k] for k in ("name", "room", "objects", "outputs", "seconds")},
                          indent=2, default=str))
         return 0

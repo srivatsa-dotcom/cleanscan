@@ -12,3 +12,4 @@ android/local.properties
 tools/decoder-test/build/
 tools/decoder-test/.gradle/
 .kotlin/
+MUJOCO_LOG.TXT

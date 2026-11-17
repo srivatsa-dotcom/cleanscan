@@ -1,0 +1,4 @@
+{"objects": [
+  {"id": 1, "class": "bottle", "name": "water \"bottle\"", "mode": "pickable", "source": "detected", "captures": {"scan": "captures/1/scan"}},
+  {"id": 101, "class": "cupboard", "name": "cupboard", "mode": "articulated", "source": "tap", "captures": {"closed": "captures/101/closed", "open": "captures/101/open"}, "seed": {"frame": 57, "u": 0.4100, "v": 0.6300}}
+]}

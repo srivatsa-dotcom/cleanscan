@@ -92,3 +92,24 @@ def test_fallback_primitive_from_room_points():
     assert physics.is_watertight(F)
     assert abs(T[2, 3] - 0.9) < 1e-6 and abs(T[0, 3] - 0.5) < 0.01
     assert 0.2 < V[:, 2].max() < 0.3
+
+
+def test_selection_written_by_the_app_loads(kitchen_session):
+    """tests/data/app_fixture is written by the app's own Kotlin code (tools/app-logic-test)."""
+    from pathlib import Path
+
+    from cleanscan import objects
+
+    fixture = Path(__file__).parent / "data" / "app_fixture"
+    sel = {s.id: s for s in objects.load_selection(fixture)}
+    assert sel[1].name == 'water "bottle"' and sel[1].mode == "pickable" and sel[1].captures == {"scan": "captures/1/scan"}
+    assert sel[101].source == "tap" and sel[101].seed_pixel == (57, 0.41, 0.63) and sel[101].seed_world is None
+    tracks = json.loads((fixture / "tracks.json").read_text())
+    assert [t["class"] for t in tracks] == ["bottle", "bottle"] and tracks[0]["thumb"] == "thumbs/1.jpg"
+    # a tap on a room-pass frame becomes a 3D point from that frame's depth
+    ses = Session.load(kitchen_session)
+    fr = ses.frames[40]
+    p = objects.seed_from_pixel(ses, fr.index, 0.5, 0.5)
+    d = ses.load_depth(fr)
+    cam = fr.pose_cv[:3, 3]
+    assert p is not None and abs(np.linalg.norm(p - cam) - d[d.shape[0] // 2, d.shape[1] // 2]) < 0.1

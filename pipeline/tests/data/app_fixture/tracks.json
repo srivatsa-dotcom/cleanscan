@@ -1,0 +1,4 @@
+[
+ {"id": 1, "class": "bottle", "coco_id": 39, "score": 0.800, "frames": 5, "first_frame": 0, "best_frame": 0, "thumb": "thumbs/1.jpg"},
+ {"id": 2, "class": "bottle", "coco_id": 39, "score": 0.600, "frames": 5, "first_frame": 0, "best_frame": 0, "thumb": "thumbs/2.jpg"}
+]

@@ -44,6 +44,7 @@ class Selected:
     source: str  # detected | tap
     captures: dict  # stage -> folder (relative to the session)
     seed_world: np.ndarray | None = None  # capture frame (Y up), tap-added objects
+    seed_pixel: tuple | None = None  # (frame index, u, v), u/v in 0..1 of the sensor image
     region: np.ndarray | None = None  # room points of this object, scene frame (Z up)
     info: dict = field(default_factory=dict)
 
@@ -60,11 +61,13 @@ def load_selection(session_dir: Path) -> list[Selected]:
         return []
     out = []
     for o in json.loads(p.read_text()).get("objects", []):
-        seed = o.get("seed", {}).get("world")
+        sd = o.get("seed") or {}
+        seed = sd.get("world")
+        pix = (int(sd["frame"]), float(sd["u"]), float(sd["v"])) if {"frame", "u", "v"} <= set(sd) else None
         out.append(Selected(id=int(o["id"]), cls=o.get("class", "object"), name=o.get("name") or o.get("class"),
                             mode=o.get("mode") or default_mode(o.get("class")), source=o.get("source", "detected"),
                             captures=o.get("captures", {}),
-                            seed_world=None if seed is None else np.asarray(seed, float)))
+                            seed_world=None if seed is None else np.asarray(seed, float), seed_pixel=pix))
     return out
 
 
@@ -107,9 +110,34 @@ def lift_instances(session: Session, vertices_capture: np.ndarray, labels: set[i
     return out
 
 
+def seed_from_pixel(session: Session, frame_index: int, u: float, v: float, window: int = 3) -> np.ndarray | None:
+    """World point (capture frame) of a tap on a room-pass frame, from that frame's depth
+    (sensor, stereo or depth module). ``u``, ``v`` in 0..1 of the sensor image."""
+    fr = next((f for f in session.frames if f.index == frame_index), None)
+    if fr is None or fr.depth_path is None:
+        return None
+    depth = session.load_depth(fr)
+    h, w = depth.shape
+    x, y = int(np.clip(u * w, 0, w - 1)), int(np.clip(v * h, 0, h - 1))
+    patch = depth[max(y - window, 0):y + window + 1, max(x - window, 0):x + window + 1]
+    z = float(np.median(patch[patch > 0])) if (patch > 0).any() else 0.0
+    if z <= 0:
+        return None
+    K = fr.K_depth
+    pc = np.array([(x + 0.5 - K[0, 2]) / K[0, 0] * z, (y + 0.5 - K[1, 2]) / K[1, 1] * z, z])
+    P = fr.pose_cv
+    return P[:3, :3] @ pc + P[:3, 3]
+
+
 def locate_objects(session: Session, selected: list[Selected], room_vertices_scene: np.ndarray,
                    T: np.ndarray) -> None:
-    """Fill ``Selected.region`` (scene frame) for detected objects from the room pass."""
+    """Fill ``Selected.region`` (scene frame) for detected objects from the room pass, and the
+    3D seed of objects the user added by tapping."""
+    for s in selected:
+        if s.seed_world is None and s.seed_pixel is not None:
+            s.seed_world = seed_from_pixel(session, *s.seed_pixel)
+            if s.seed_world is None:
+                log.warning("object %s: no depth at the tapped point", s.slug)
     labels = {s.id for s in selected if s.source == "detected"}
     if not labels or not any(f.extra.get("instances") for f in session.frames):
         return

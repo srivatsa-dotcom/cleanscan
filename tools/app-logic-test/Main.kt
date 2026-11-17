@@ -7,7 +7,10 @@ import com.cleanscan.app.CoverageRing
 import com.cleanscan.app.ObjectJson
 import com.cleanscan.app.ObjectTracker
 import com.cleanscan.app.SelectedObject
+import com.cleanscan.app.ClockSync
+import com.cleanscan.app.DepthFrameAssembler
 import com.cleanscan.app.YoloSegDecoder
+import com.cleanscan.app.moduleIntrinsics
 import com.cleanscan.app.cameraPitchDeg
 import com.cleanscan.app.instanceLabels
 import com.cleanscan.app.portraitToSensor
@@ -57,6 +60,37 @@ fun main(args: Array<String>) {
     val lab = instanceLabels(listOf(det), intArrayOf(7), 8, 6)
     check(lab[5 * 8 + 3] == 7.toShort() && lab[0 * 8 + 3] == 0.toShort(), "portrait mask -> landscape labels")
     check(portraitToSensor(0.25f, 0.5f) == Pair(0.5f, 0.75f), "tap position -> sensor coordinates")
+
+    // depth module: CSD1 frames built byte by byte as the firmware sends them
+    fun packets(fid: Int, t: Double, w: Int, h: Int, mm: ShortArray): List<ByteArray> {
+        val data = java.nio.ByteBuffer.allocate(2 * w * h).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        mm.forEach { data.putShort(it) }
+        val bytes = data.array()
+        val per = (1400 - 26) and 1.inv()
+        val n = (bytes.size + per - 1) / per
+        return (0 until n).map { k ->
+            val chunk = bytes.copyOfRange(k * per, minOf(bytes.size, (k + 1) * per))
+            java.nio.ByteBuffer.allocate(26 + chunk.size).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .put("CSD1".toByteArray()).put(3).put(1).putShort(w.toShort()).putShort(h.toShort())
+                .putInt(fid).putShort(k.toShort()).putShort(n.toShort()).putDouble(t).put(chunk).array()
+        }
+    }
+    val img = ShortArray(100 * 100) { ((it * 37) % 2600).toShort() }
+    val pk = packets(42, 123.5, 100, 100, img).shuffled(java.util.Random(1))
+    val asm = DepthFrameAssembler()
+    val got = pk.mapNotNull { asm.feed(it) }
+    check(pk.size == 15 && got.size == 1 && got[0].mm.contentEquals(img) && got[0].t == 123.5 && got[0].frameId == 42L,
+        "depth frame reassembled from 15 shuffled packets")
+    packets(43, 124.0, 100, 100, img).dropLast(1).forEach { asm.feed(it) }
+    val next = packets(44, 124.1, 100, 100, img).mapNotNull { asm.feed(it) }
+    check(next.single().frameId == 44L && asm.dropped == 1, "a frame with a lost packet is dropped")
+    val cs = ClockSync()
+    cs.add(10.0, 1010.02, 10.05)  // slow exchange
+    cs.add(11.0, 1011.0025, 11.005)  // fast one wins: offset = 1011.0025 - 11.0025 = 1000
+    check(kotlin.math.abs(cs.offset - 1000.0) < 1e-9 && kotlin.math.abs(cs.toPhone(1500.0) - 500.0) < 1e-9,
+        "clock sync uses the shortest round trip")
+    val k = moduleIntrinsics(100, 100, 70.0, 60.0)
+    check(kotlin.math.abs(k[0] - 71.41) < 0.01 && k[2] == 50.0, "A010 intrinsics from its field of view")
 
     // fixture scan for the Python loader
     val out = File(args.getOrElse(0) { "fixture" }).apply { mkdirs() }

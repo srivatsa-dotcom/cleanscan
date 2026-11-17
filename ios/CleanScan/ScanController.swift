@@ -27,6 +27,16 @@ final class ScanController: NSObject, ObservableObject, ARSessionDelegate {
     }
     private var streams: StreamRecorder?
 
+    /// Clip-on depth module (module/): ToF frames recorded next to the camera frames.
+    let depthModule = DepthModuleClient()
+    @Published var depthModuleEnabled = UserDefaults.standard.bool(forKey: "depthModuleEnabled") {
+        didSet { UserDefaults.standard.set(depthModuleEnabled, forKey: "depthModuleEnabled"); updateDepthModule() }
+    }
+    @Published var depthModuleHost = UserDefaults.standard.string(forKey: "depthModuleHost") ?? "192.168.4.1" {
+        didSet { UserDefaults.standard.set(depthModuleHost, forKey: "depthModuleHost"); updateDepthModule() }
+    }
+    private var depthRecorder: DepthRecorder?
+
     // MARK: RL scenes: object selection + guided capture (docs/RL_SCENES_PLAN.md)
     enum Phase { case idle, room, selecting, capturing }
     struct Keyframe: Identifiable { let id: Int; let image: UIImage }
@@ -74,10 +84,30 @@ final class ScanController: NSObject, ObservableObject, ARSessionDelegate {
         view.renderOptions.insert(.disableMotionBlur)
         startSession()
         updateRig()
+        updateDepthModule()
     }
 
     private func updateRig() {
         if rigEnabled { rig.start(host: rigHost) } else { rig.stop() }
+    }
+
+    private func updateDepthModule() {
+        if depthModuleEnabled { depthModule.start(preferredHost: depthModuleHost) } else { depthModule.stop() }
+    }
+
+    /// Record the module's frames into this session folder (room pass or a guided capture).
+    private func startDepthRecording(in directory: URL) {
+        guard depthModuleEnabled else { return }
+        let rec = DepthRecorder(directory: directory)
+        depthRecorder = rec
+        let client = depthModule
+        client.onFrame = { rec.add($0, fovDeg: client.fovDeg) }
+    }
+
+    private func finishDepthRecording() {
+        depthModule.onFrame = nil
+        depthRecorder?.finish(sensor: depthModule.sensor, fovDeg: depthModule.fovDeg, rttMs: depthModule.rttMs)
+        depthRecorder = nil
     }
 
     var cameraOnly: Bool { !lidarAvailable }
@@ -143,6 +173,7 @@ final class ScanController: NSObject, ObservableObject, ARSessionDelegate {
             let s = try StreamRecorder(directory: w.directory)
             streams = s
             rig.onReadings = { s.addLidar($0) }
+            startDepthRecording(in: w.directory)
             frameCount = 0
             lastPose = nil
             tracker = ObjectTracker()
@@ -164,6 +195,7 @@ final class ScanController: NSObject, ObservableObject, ARSessionDelegate {
         let w = writer
         writer = nil
         rig.onReadings = nil
+        finishDepthRecording()
         let rigInfo: [String: Any]? = rigEnabled ? [
             "sensor": rig.sensor, "kind": rig.kind, "host": rigHost,
             "clock_rtt_ms": rig.rttMs ?? -1,
@@ -269,6 +301,7 @@ final class ScanController: NSObject, ObservableObject, ARSessionDelegate {
             let s = try StreamRecorder(directory: w.directory)
             streams = s
             rig.onReadings = { s.addLidar($0) }
+            startDepthRecording(in: w.directory)
         } catch {
             status = "Cannot start: \(error.localizedDescription)"
             return
@@ -309,6 +342,7 @@ final class ScanController: NSObject, ObservableObject, ARSessionDelegate {
         let w = writer
         writer = nil
         rig.onReadings = nil
+        finishDepthRecording()
         let s = streams
         streams = nil
         let cov = ring?.fraction

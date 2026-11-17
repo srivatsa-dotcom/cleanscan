@@ -21,6 +21,9 @@ Scan-20261022-101500/
   selection.json      # optional (RL scenes): objects the user made interactive
   captures/<id>/<stage>/  # optional (RL scenes): one guided capture = a complete session
                           # (+ object_mask/000000.png: 255 = the object, depth resolution)
+  tof/000000.png      # optional: clip-on depth module frames, 16-bit mm, 0 = no data
+  tof.jsonl           # optional: one record per module frame (below)
+  depth_module.json   # optional: module description, written when tof/ exists
 ```
 
 `depth/` and `confidence/` are absent for camera-only captures (phones without LiDAR/ToF);
@@ -96,3 +99,17 @@ index and position in 0..1 of the sensor (landscape) image; the pipeline turns i
 point with that frame's depth. An object whose `captures` is empty was skipped and stays part
 of the static room. Guided captures run in the same AR session as the room pass, so all poses
 share one world frame.
+
+## Depth module (optional)
+
+Written by the apps when the clip-on depth module (module/README.md) is on, in the room pass
+and in every guided capture (each with its own `poses.bin`, which the pipeline needs to place
+module frames between camera frames).
+
+`tof.jsonl` record: `{"index", "t", "depth", "intrinsics": [fx, fy, cx, cy], "size": [w, h]}`;
+`t` is on the phone clock (same as `timestamp` in frames.jsonl), converted from the module's
+clock with the ping/pong sync. Module images use OpenCV camera axes (x right, y down, z forward).
+
+`depth_module.json`: `{"sensor": "a010", "fov_deg": [70, 60], "depth_unit": 0.001,
+"frame": "opencv", "clock_rtt_ms", "frames"}`, optionally `"extrinsic"` (16 numbers, row-major,
+module -> phone camera in OpenGL axes) to skip the automatic calibration.

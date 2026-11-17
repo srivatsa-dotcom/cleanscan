@@ -41,6 +41,7 @@ class GuidedCaptureFlow(
     private val segmenter: LivingSegmenter,
     private val status: TextView,
     private val recordButton: Button,
+    private val depth: DepthRecording,
     private val onFinished: () -> Unit,
 ) {
     private class Candidate(val obj: SelectedObject, var checked: Boolean, val thumb: File?, val frames: Int)
@@ -272,6 +273,7 @@ class GuidedCaptureFlow(
         val dir = scanDir ?: return
         val rel = "captures/${obj.id}/$stageName"
         val writer = SessionWriter.createCapture(dir, rel)
+        depth.start(writer.dir)
         obj.captures[stageName] = rel
         val cocoIndex = COCO_NAMES.indexOf(obj.cls)
         val captureClass = when {
@@ -297,6 +299,7 @@ class GuidedCaptureFlow(
     private fun stopStage() {
         val r = recorder ?: return
         recorder = null
+        depth.finish()
         val cov = coverage?.fraction
         r.finish {}
         if (cov != null && cov < 0.8f) {
@@ -312,7 +315,7 @@ class GuidedCaptureFlow(
     }
 
     private fun skipObject() {
-        recorder?.let { it.finish {}; recorder = null }
+        recorder?.let { it.finish {}; recorder = null; depth.finish() }
         obj.captures.clear()
         stage = 0
         current++

@@ -10,7 +10,7 @@ import json
 import logging
 import shutil
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -136,12 +136,29 @@ def load_declared_objects(path: Path, scene_dir: Path, table: dict, cfg: RLConfi
     return out
 
 
+def load_capture(path: Path, room, cfg: RLConfig):
+    """A guided object capture with depth: sensor depth, else the clip-on module (with the
+    room pass calibration), else camera stereo."""
+    from . import depthmodule, stereo
+    from .session import Session
+
+    ses = Session.load(path)
+    if ses.has_sensor_depth:
+        return ses
+    if room.depth_module is not None and depthmodule.has_depth_module(ses):
+        # near the object the module sees everything; stereo there would only add errors
+        dcfg = replace(cfg.pipeline.depth_module, stereo_fill=False)
+        depthmodule.estimate_session_depth(ses, dcfg, T_cam_module=room.depth_module.T_cam_module)
+    else:
+        stereo.estimate_session_depth(ses, cfg.pipeline.stereo)
+    return ses
+
+
 def objects_from_selection(session_dir: Path, room, scene_dir: Path, table: dict, cfg: RLConfig,
                            heights: np.ndarray, warnings: list[str]) -> list[SceneObject]:
     """The objects the user selected in the app, reconstructed from their guided captures."""
     from . import objects as objmod
     from . import pickable
-    from .session import Session
 
     selected = objmod.load_selection(session_dir)
     if not selected:
@@ -168,7 +185,7 @@ def objects_from_selection(session_dir: Path, room, scene_dir: Path, table: dict
         textured = None
         if cap_dir is not None and (cap_dir / "session.json").exists():
             try:
-                res = pickable.reconstruct_pickable(Session.load(cap_dir), cfg.pickable)
+                res = pickable.reconstruct_pickable(load_capture(cap_dir, room, cfg), cfg.pickable)
                 V, F, textured = res.V, res.F, res.textured
                 info["reconstruction"] = res.info
             except Exception as exc:  # noqa: BLE001 - fall back to the room-pass shape
@@ -200,7 +217,6 @@ def objects_from_selection(session_dir: Path, room, scene_dir: Path, table: dict
 def _transparent_object(s, session_dir: Path, room, scene_dir: Path, table: dict, cfg: RLConfig,
                         info: dict, warnings: list[str], heights: np.ndarray) -> SceneObject | None:
     from . import pickable, transparent
-    from .session import Session
 
     caps = {k: session_dir / v for k, v in s.captures.items()}
     prof = caps.get("profile")
@@ -208,9 +224,9 @@ def _transparent_object(s, session_dir: Path, room, scene_dir: Path, table: dict
         warnings.append(f"{s.slug}: no side-profile capture; left in the static room")
         return None
     top = caps.get("top")
-    top_ses = Session.load(top) if top is not None and (top / "session.json").exists() else None
+    top_ses = load_capture(top, room, cfg) if top is not None and (top / "session.json").exists() else None
     try:
-        res = transparent.reconstruct_transparent(Session.load(prof), top_ses, cfg.transparent)
+        res = transparent.reconstruct_transparent(load_capture(prof, room, cfg), top_ses, cfg.transparent)
     except Exception as exc:  # noqa: BLE001
         warnings.append(f"{s.slug}: silhouette reconstruction failed ({exc}); left in the static room")
         return None
@@ -236,7 +252,6 @@ DRAWER_PARENTS = {"cupboard", "cabinet", "dresser", "desk", "kitchen cabinet", "
 def _articulated_object(s, session_dir: Path, room, scene_dir: Path, table: dict, cfg: RLConfig,
                         info: dict, warnings: list[str]) -> SceneObject | None:
     from . import articulated
-    from .session import Session
     from .texture import TextureConfig, bake_texture
 
     caps = {k: session_dir / v for k, v in s.captures.items()}
@@ -248,7 +263,7 @@ def _articulated_object(s, session_dir: Path, room, scene_dir: Path, table: dict
     anchor = s.region.mean(0) if s.region is not None else (
         room.T[:3, :3] @ s.seed_world + room.T[:3, 3] if s.seed_world is not None else np.zeros(3))
     floor_y = float((Tinv @ np.array([anchor[0], anchor[1], 0.0, 1.0]))[1])
-    closed, opened = Session.load(caps["closed"]), Session.load(caps["open"])
+    closed, opened = load_capture(caps["closed"], room, cfg), load_capture(caps["open"], room, cfg)
     try:
         res = articulated.reconstruct_articulated(closed, opened, room.session, floor_y, region_c, cfg.articulated)
     except Exception as exc:  # noqa: BLE001
@@ -361,7 +376,8 @@ def process_rl(session_dir: str | Path, scene_dir: str | Path, cfg: RLConfig) ->
     report = {
         "name": name, "units": "m", "up": "z",
         "room": {k: room_report[k] for k in ("frames", "depth_source", "triangles_visual",
-                                             "triangles_collision", "ghost_triangles_removed", "extent_m")}
+                                             "triangles_collision", "ghost_triangles_removed", "extent_m",
+                                             "depth_module") if k in room_report}
                 | {"collision_boxes": len(boxes), "triangles_carved": n_carved},
         "objects": [{"id": o.id, "class": o.cls, "type": o.type,
                      "mass_kg": round(sum(lk.mass for lk in o.links), 4), **o.info} for o in objects],

@@ -70,6 +70,9 @@ class Session:
         self.meta = meta
         self.frames = frames
         self.depth_unit = float(meta.get("depth_unit", 0.001))
+        # 1-sigma depth noise model (abs m, relative) of whatever depth the frames point at;
+        # set by stereo / the depth module when they produce the depth
+        self.depth_noise: tuple[float, float] = (0.002, 0.004)
         self.confidence_levels = int(meta.get("confidence_levels", 3))
         self.poses: tuple[np.ndarray, np.ndarray] | None = None  # (t, camera_to_world GL)
         self.lidar: np.ndarray | None = None  # LIDAR_DTYPE records

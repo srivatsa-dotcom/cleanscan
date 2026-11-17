@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import open3d as o3d
 
-from . import gazebo, ghosts, lidar, mesh as meshops, occupancy, stereo
+from . import depthmodule, gazebo, ghosts, lidar, mesh as meshops, occupancy, stereo
 from .fusion import FusionConfig, integrate
 from .masks import resegment_session
 from .session import Session
@@ -30,6 +30,9 @@ class PipelineConfig:
     lidar: lidar.LidarConfig = field(default_factory=lidar.LidarConfig)
     # With an external LiDAR on a phone without depth sensor, also fuse camera stereo depth?
     rig_stereo: bool = True
+    # Clip-on ToF module (tof.jsonl): use it on phones without a depth sensor
+    use_depth_module: bool = True
+    depth_module: depthmodule.DepthModuleConfig = field(default_factory=depthmodule.DepthModuleConfig)
     texture_mode: str = "photo"  # photo | none
     ghost_removal: bool = True
     ghost_min_votes: int = 3
@@ -74,6 +77,7 @@ class RoomResult:
     n_ghost: int
     dynamic_masks: dict | None
     t0: float
+    depth_module: depthmodule.DepthModuleResult | None = None
 
 
 def reconstruct_room(session_dir: str | Path, cfg: PipelineConfig) -> RoomResult:
@@ -85,7 +89,17 @@ def reconstruct_room(session_dir: str | Path, cfg: PipelineConfig) -> RoomResult
 
     camera_only = not session.has_sensor_depth
     use_frames = True
-    if camera_only and session.has_lidar and not cfg.rig_stereo and session.rig.get("kind", "2d") == "2d":
+    dm = None
+    if camera_only and cfg.use_depth_module and depthmodule.has_depth_module(session):
+        # the guided object captures (same clock and world) help the module calibration
+        caps = [Session.load(p.parent) for p in sorted(session.root.glob("captures/*/*/session.json"))]
+        T_cm, calib = depthmodule.calibrate_module(session, depthmodule.load_tof(session), cfg.depth_module,
+                                                   extra_sessions=caps)
+        log.info("phone without depth sensor + depth module: depth from the module, stereo beyond its range")
+        dm = depthmodule.estimate_session_depth(session, cfg.depth_module, T_cam_module=T_cm,
+                                                stereo_cfg=cfg.stereo)
+        dm.calibration = calib
+    elif camera_only and session.has_lidar and not cfg.rig_stereo and session.rig.get("kind", "2d") == "2d":
         use_frames = False
         log.info("external LiDAR only (camera stereo disabled)")
     elif camera_only:
@@ -142,7 +156,7 @@ def reconstruct_room(session_dir: str | Path, cfg: PipelineConfig) -> RoomResult
     textured = None
     if cfg.texture_mode == "photo":
         textured = transform_textured(bake_texture(session, world_mesh, cfg.texture, dyn or None), T)
-    return RoomResult(session, aligned, textured, T, cloud, camera_only, use_frames, n_ghost, dyn, t0)
+    return RoomResult(session, aligned, textured, T, cloud, camera_only, use_frames, n_ghost, dyn, t0, dm)
 
 
 def export_room(room: RoomResult, out_dir: str | Path, cfg: PipelineConfig) -> dict:
@@ -163,13 +177,22 @@ def export_room(room: RoomResult, out_dir: str | Path, cfg: PipelineConfig) -> d
     report = {
         "name": cfg.name,
         "frames": len(session.frames),
-        "depth_source": ("sensor" if not room.camera_only else "stereo" if room.use_frames else "none")
+        "depth_source": ("sensor" if not room.camera_only
+                         else f"depth module ({depthmodule.module_info(session).get('sensor', '?')})"
+                         + (" + stereo fill" if room.depth_module and cfg.depth_module.stereo_fill else "")
+                         if room.depth_module is not None
+                         else "stereo" if room.use_frames else "none")
                         + (" + external LiDAR" if cloud is not None else ""),
         "rig": None if cloud is None else {
             "sensor": session.rig.get("sensor"), "kind": cloud.kind,
             "readings_used": int(cloud.keep.sum()), "readings_dropped": int((~cloud.keep).sum()),
             "calibration": cloud.calibration, "T_camera_lidar": cloud.T_cam_lidar.tolist(),
         },
+        **({"depth_module": {"sensor": depthmodule.module_info(session).get("sensor"),
+                             "T_camera_module": room.depth_module.T_cam_module.tolist(),
+                             "calibration": room.depth_module.calibration,
+                             "pixels_with_depth": round(room.depth_module.coverage, 3)}}
+           if room.depth_module is not None else {}),
         "platform": session.meta.get("platform"),
         "triangles_visual": len(aligned.triangles),
         "triangles_collision": len(collision.triangles),

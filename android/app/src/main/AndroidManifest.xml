@@ -16,6 +16,8 @@
 
         <!-- ARCore is required (the app is useless without it) -->
         <meta-data android:name="com.google.ar.core" android:value="required" />
+        <!-- segmentation model file in assets/ (app/build.gradle.kts: cleanscan.segModel) -->
+        <meta-data android:name="com.cleanscan.segModel" android:value="${segModel}" />
 
         <activity
             android:name=".MainActivity"

@@ -25,6 +25,9 @@ targets:
         CFBundleDisplayName: CleanScan
         NSCameraUsageDescription: CleanScan uses the camera (and LiDAR where available) to scan your environment.
         NSLocalNetworkUsageDescription: CleanScan connects to your LiDAR rig or clip-on depth module on the local Wi-Fi.
+        # people/animal/object segmentation model (YOLO-seg layout, COCO classes); the bundled
+        # LivingSeg is Ultralytics YOLO11n-seg (AGPL-3.0), see LICENSES.md
+        CleanScanSegModel: LivingSeg
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         UIRequiredDeviceCapabilities: [arkit]

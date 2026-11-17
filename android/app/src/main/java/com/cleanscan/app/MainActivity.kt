@@ -66,7 +66,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
         segmenter = LivingSegmenter(this)
         if (!segmenter.available) {
-            status.text = "Warning: ${LivingSegmenter.MODEL} missing - people/animals will NOT be masked " +
+            status.text = "Warning: ${segmenter.modelName} missing - people/animals will NOT be masked " +
                 "on the phone (desktop --resegment and ghost removal still work)"
         }
         val scansButton = findViewById<Button>(R.id.scans)

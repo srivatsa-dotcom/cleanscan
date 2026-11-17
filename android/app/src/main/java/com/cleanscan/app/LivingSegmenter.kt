@@ -15,13 +15,20 @@ import java.nio.channels.FileChannel
  * app/src/main/assets/living_seg.tflite (see tools/export_models.py).
  */
 class LivingSegmenter(context: Context) {
+    /** Model file in assets/: manifest meta-data com.cleanscan.segModel (gradle property
+     * cleanscan.segModel), default living_seg.tflite. */
+    val modelName: String = try {
+        context.packageManager.getApplicationInfo(context.packageName, android.content.pm.PackageManager.GET_META_DATA)
+            .metaData?.getString("com.cleanscan.segModel") ?: MODEL
+    } catch (e: Exception) { MODEL }
+
     private val interpreter: Interpreter? = try {
-        val fd = context.assets.openFd(MODEL)
+        val fd = context.assets.openFd(modelName)
         val buf = FileInputStream(fd.fileDescriptor).channel
             .map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
         Interpreter(buf, Interpreter.Options().setNumThreads(4))
     } catch (e: Exception) {
-        Log.w(TAG, "no segmentation model ($MODEL): ${e.message}")
+        Log.w(TAG, "no segmentation model ($modelName): ${e.message}")
         null
     }
 

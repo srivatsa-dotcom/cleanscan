@@ -42,8 +42,15 @@ final class LivingBeingMasker {
 
     var hasModel: Bool { model != nil }
 
+    /// Core ML model name: Info.plist key CleanScanSegModel (project.yml), default "LivingSeg".
+    /// Any YOLO-seg export (nms=False) with COCO class order works; see LICENSES.md for why
+    /// you may want to replace the bundled AGPL-3.0 YOLO11 model.
+    static var modelName: String {
+        Bundle.main.object(forInfoDictionaryKey: "CleanScanSegModel") as? String ?? "LivingSeg"
+    }
+
     init() {
-        if let url = Bundle.main.url(forResource: "LivingSeg", withExtension: "mlmodelc"),
+        if let url = Bundle.main.url(forResource: Self.modelName, withExtension: "mlmodelc"),
            let ml = try? MLModel(contentsOf: url, configuration: MLModelConfiguration()) {
             model = try? VNCoreMLModel(for: ml)
         } else {

@@ -460,8 +460,9 @@ def make_kitchen_session(out: str | Path, room_frames: int = 140, capture_frames
             height = 0.9 if o.id == "fridge" else 0.45
             center = o.pose_k[:3, 3] + [0, 0, height]
             for stage, opened in (("closed", None), ("open", o.id)):
-                p = arc_poses(center, front, 1.5, capture_frames,
-                              heights=(1.0, 1.7) if o.id == "fridge" else (0.9, 1.5))
+                # the user frames the whole object: a fridge needs ~2 m distance
+                p = arc_poses(center, front, 2.0 if o.id == "fridge" else 1.5, capture_frames,
+                              heights=(0.9, 1.7) if o.id == "fridge" else (0.9, 1.5))
                 write_session(base_dir / stage, p,
                               lambda i, opened=opened: room_static + placed_objects(opened=opened),
                               color_size, depth_size, rng, t0=t, with_depth=with_depth)

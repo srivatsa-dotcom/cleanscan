@@ -289,7 +289,7 @@ def _K(size, fov=np.radians(60)):
 
 def write_session(out: Path, poses: list[np.ndarray], scene_at, color_size, depth_size, rng, t0=0.0,
                   noise=0.004, with_depth=True, people_masks=True, instances=False,
-                  object_mask_label: int | None = None, dt=0.1) -> dict:
+                  object_mask_label: int | None = None, dt=0.1, depth_module: str | None = None) -> dict:
     """Render a capture session. ``scene_at(i) -> list[Placed]``. Returns per-label stats."""
     out = Path(out)
     dirs = ["color", "depth", "confidence", "mask"] + (["instances"] if instances else []) \
@@ -334,8 +334,94 @@ def write_session(out: Path, poses: list[np.ndarray], scene_at, color_size, dept
         "format": "cleanscan-capture", "version": 1, "platform": "synthetic", "device": "synthetic kitchen",
         "depth_unit": 0.001, "confidence_levels": 3, "world_up": "y", "camera_convention": "opengl",
         "depth_source": "synthetic" if with_depth else "none",
-        "extensions": ["objects"]}, indent=2))
+        "extensions": ["objects"] + (["depth_module"] if depth_module else [])}, indent=2))
+    if depth_module:
+        simulate_depth_module(out, poses, scene_at, t0, dt, rng, depth_module)
     return stats
+
+
+# --------------------------------------------------------------------------- depth module
+
+
+A010 = {"size": (100, 100), "fov_deg": (70.0, 60.0), "min_range": 0.2, "max_range": 2.5, "fps": 15.0}
+
+
+def module_extrinsic() -> np.ndarray:
+    """Clip-on module -> phone camera: ToF optical frame (OpenCV: x right, y down, z forward)
+    into the phone's OpenGL camera frame; 3 cm above the lens, off by a few degrees."""
+    R0 = np.diag([1.0, -1.0, -1.0])  # OpenCV -> OpenGL axes, looking the same way
+    tilt = o3d.geometry.get_rotation_matrix_from_xyz(np.radians([3.0, -2.0, 1.5]))
+    T = np.eye(4)
+    T[:3, :3] = tilt @ R0
+    T[:3, 3] = (0.006, 0.03, 0.004)
+    return T
+
+
+def simulate_depth_module(out: Path, poses: list[np.ndarray], scene_at, t0: float, dt: float, rng,
+                          sensor: str = "a010") -> None:
+    """MaixSense A010 as recorded by the app: tof/*.png (mm) + tof.jsonl on the phone clock,
+    poses.bin at 60 Hz and depth_module.json. Noise ~0.6 % + 4 mm, 5 mm quantisation,
+    flying pixels on depth edges, 3 % dropouts, range 0.2-2.5 m, glass invisible."""
+    from scipy.spatial.transform import Rotation, Slerp
+
+    from .session import POSE_DTYPE
+
+    spec = A010
+    w, h = spec["size"]
+    fx = (w / 2) / np.tan(np.radians(spec["fov_deg"][0]) / 2)
+    fy = (h / 2) / np.tan(np.radians(spec["fov_deg"][1]) / 2)
+    K = np.array([[fx, 0, w / 2], [0, fy, h / 2], [0, 0, 1.0]])
+    T_cm = module_extrinsic()
+    times = t0 + dt * np.arange(len(poses))
+    P = np.stack(poses)
+    slerp = Slerp(times, Rotation.from_matrix(P[:, :3, :3])) if len(poses) > 1 else None
+
+    def pose_at(t):
+        if slerp is None:
+            return P[0]
+        t = np.clip(t, times[0], times[-1])
+        M = np.eye(4)
+        M[:3, :3] = slerp([t]).as_matrix()[0]
+        M[:3, 3] = [np.interp(t, times, P[:, k, 3]) for k in range(3)]
+        return M
+
+    t60 = np.arange(times[0], times[-1] + 1e-9, 1 / 60)
+    rec = np.zeros(len(t60), POSE_DTYPE)
+    rec["t"] = t60
+    rec["m"] = [pose_at(t).reshape(-1) for t in t60]
+    rec.tofile(out / "poses.bin")
+
+    (out / "tof").mkdir(exist_ok=True)
+    lines = []
+    t_tof = np.arange(times[0], times[-1], 1 / spec["fps"])
+    for k, t in enumerate(t_tof):
+        i = int(np.clip(round((t - t0) / dt), 0, len(poses) - 1))
+        placed = [p for p in scene_at(i)]
+        # module (OpenCV axes) -> world; _render takes an OpenGL-axes pose and flips it itself
+        pose_m_cv = pose_at(t) @ T_cm
+        _, depth, _ = _render(placed, K, (w, h), pose_m_cv @ GL_TO_CV)
+        d = depth.astype(np.float64)
+        valid = (d > spec["min_range"]) & (d < spec["max_range"])
+        # flying pixels: on depth edges the sensor mixes foreground and background
+        import cv2 as _cv2
+
+        dmax = _cv2.dilate(d.astype(np.float32), np.ones((3, 3), np.uint8))
+        dmin = _cv2.erode(np.where(d > 0, d, 99).astype(np.float32), np.ones((3, 3), np.uint8))
+        edge = (dmax - dmin) > 0.1 * np.maximum(d, 0.1)
+        mix = edge & (rng.random(d.shape) < 0.5)
+        d = np.where(mix, 0.5 * (dmax + dmin), d)
+        d = d + rng.normal(0, 1, d.shape) * (0.004 + 0.006 * d)
+        d = np.round(d / 0.005) * 0.005
+        d[~valid | (rng.random(d.shape) < 0.03)] = 0
+        name = f"{k:06d}"
+        cv2.imwrite(str(out / "tof" / f"{name}.png"), np.clip(d * 1000, 0, 65535).astype(np.uint16))
+        jitter = rng.normal(0, 0.002)  # residual of the clock sync
+        lines.append(json.dumps({"index": k, "t": round(float(t + jitter), 5), "depth": f"tof/{name}.png",
+                                 "intrinsics": [fx, fy, w / 2, h / 2], "size": [w, h]}))
+    (out / "tof.jsonl").write_text("\n".join(lines) + "\n")
+    (out / "depth_module.json").write_text(json.dumps({
+        "sensor": sensor, "fov_deg": list(spec["fov_deg"]), "depth_unit": 0.001,
+        "frame": "opencv", "clock_rtt_ms": 4.0}, indent=2))
 
 
 # --------------------------------------------------------------------------- session
@@ -343,7 +429,8 @@ def write_session(out: Path, poses: list[np.ndarray], scene_at, color_size, dept
 
 def make_kitchen_session(out: str | Path, room_frames: int = 140, capture_frames: int = 40,
                          color_size=(640, 480), depth_size=(256, 192), seed: int = 0,
-                         with_depth: bool = True) -> Path:
+                         with_depth: bool = True, depth_module: str | None = None) -> Path:
+    """``with_depth=False, depth_module="a010"`` is an iPhone 11 with the clip-on module."""
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
@@ -380,7 +467,7 @@ def make_kitchen_session(out: str | Path, room_frames: int = 140, capture_frames
 
     poses = [room_pass_pose(i / room_frames) for i in range(room_frames)]
     stats = write_session(out, poses, room_scene, color_size, depth_size, rng, with_depth=with_depth,
-                          instances=True)
+                          instances=True, depth_module=depth_module)
     t_end = room_frames * 0.1
 
     # ---- what the phone's detector reports (cupboard: not a COCO class -> added by tap) ---
@@ -429,7 +516,8 @@ def make_kitchen_session(out: str | Path, room_frames: int = 140, capture_frames
             write_session(base_dir / "scan", p,
                           lambda i, o=o, spot_k=spot_k: room_static
                           + placed_objects(moved=(o.id, spot_k)),
-                          color_size, depth_size, rng, t0=t, with_depth=with_depth, object_mask_label=o.track_id)
+                          color_size, depth_size, rng, t0=t, with_depth=with_depth, object_mask_label=o.track_id,
+                          depth_module=depth_module)
             caps["scan"] = f"captures/{o.track_id}/scan"
             t += capture_frames * 0.1 + 5
         elif o.mode == "articulated":
@@ -442,7 +530,8 @@ def make_kitchen_session(out: str | Path, room_frames: int = 140, capture_frames
                               heights=(0.9, 1.7) if o.id == "fridge" else (0.9, 1.5))
                 write_session(base_dir / stage, p,
                               lambda i, opened=opened: room_static + placed_objects(opened=opened),
-                              color_size, depth_size, rng, t0=t, with_depth=with_depth)
+                              color_size, depth_size, rng, t0=t, with_depth=with_depth,
+                              depth_module=depth_module)
                 caps[stage] = f"captures/{o.track_id}/{stage}"
                 t += capture_frames * 0.1 + 5
         else:  # transparent: side profile with the phone level, then one top-down shot
@@ -459,7 +548,7 @@ def make_kitchen_session(out: str | Path, room_frames: int = 140, capture_frames
                 write_session(base_dir / stage, p,
                               lambda i: room_static + placed_objects(),
                               color_size, depth_size, rng, t0=t, with_depth=with_depth,
-                              object_mask_label=o.track_id)
+                              object_mask_label=o.track_id, depth_module=depth_module)
                 caps[stage] = f"captures/{o.track_id}/{stage}"
                 t += len(p) * 0.1 + 5
         sel = {"id": o.track_id, "class": o.cls, "name": o.id, "mode": o.mode, "captures": caps,
@@ -492,6 +581,7 @@ def make_kitchen_session(out: str | Path, room_frames: int = 140, capture_frames
     (out / "selection.json").write_text(json.dumps({"objects": selection}, indent=1))
     (out / "truth.json").write_text(json.dumps({
         "note": "ground truth for tests; poses map the object frame (Z up) into the capture frame (Y up)",
+        "T_camera_module": module_extrinsic().tolist() if depth_module else None,
         "objects": truth}, indent=1))
     return out
 

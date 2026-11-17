@@ -102,6 +102,10 @@ def main(argv=None) -> int:
     k.add_argument("out", type=Path)
     k.add_argument("--frames", type=int, default=140, help="room pass frames")
     k.add_argument("--capture-frames", type=int, default=40, help="frames per object capture")
+    k.add_argument("--depth-module", choices=["a010"], default=None,
+                   help="phone without depth sensor (iPhone 11) + this clip-on depth module")
+    k.add_argument("--no-depth", action="store_true", help="phone without depth sensor, no module (stereo)")
+    k.add_argument("--small", action="store_true", help="320x240 colour, 160x120 depth (fast, for tests)")
 
     s = sub.add_parser("synth", help="write a synthetic demo session (room + walking person + dog)")
     s.add_argument("out", type=Path)
@@ -128,7 +132,10 @@ def main(argv=None) -> int:
     if a.cmd == "synth-kitchen":
         from .synthetic_kitchen import make_kitchen_session
 
-        print(make_kitchen_session(a.out, room_frames=a.frames, capture_frames=a.capture_frames))
+        size = {"color_size": (320, 240), "depth_size": (160, 120)} if a.small else {}
+        print(make_kitchen_session(a.out, room_frames=a.frames, capture_frames=a.capture_frames,
+                                   with_depth=not (a.no_depth or a.depth_module), depth_module=a.depth_module,
+                                   **size))
         return 0
 
     if a.cmd == "validate":

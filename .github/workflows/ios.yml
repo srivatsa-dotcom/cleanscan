@@ -1,12 +1,11 @@
-# Builds the iPhone app on a GitHub macOS runner and publishes an UNSIGNED .ipa as the
-# "ios-latest" release. Sign + install it with your own Apple ID (e.g. Sideloadly),
+# Builds the iPhone app on a GitHub macOS runner on every push to main and publishes an
+# UNSIGNED .ipa to the "latest" release (and, for old links, "ios-latest"). Sign + install it with your own Apple ID (e.g. Sideloadly),
 # see README "iPhone app". On failure the xcodebuild log goes to the `ci-logs-ios` branch.
 name: iOS app
 
 on:
   push:
     branches: [main, "feature/**"]
-    paths: ["ios/**", ".github/workflows/ios.yml"]
   pull_request:
     paths: ["ios/**", ".github/workflows/ios.yml"]
   workflow_dispatch:
@@ -54,6 +53,13 @@ jobs:
             --prerelease \
             --title "CleanScan iPhone - latest test build (unsigned)" \
             --notes "Unsigned build of ${GITHUB_SHA::7}. Sign and install it with your Apple ID using Sideloadly (Windows/macOS) or AltStore; see the README."
+
+      - name: Publish to the "latest" release
+        if: github.ref == 'refs/heads/main'
+        uses: ./.github/actions/publish-latest
+        with:
+          files: CleanScan-unsigned.ipa
+          token: ${{ github.token }}
 
       - name: Save build log to the ci-logs-ios branch
         if: failure()

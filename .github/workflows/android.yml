@@ -1,5 +1,5 @@
-# Builds the Android app on every push that touches it and publishes the APK as the
-# "android-latest" release:
+# Builds the Android app on every push to main and publishes CleanScan.apk to the "latest"
+# release (and, for old links, CleanScan-debug.apk to "android-latest"):
 #   https://github.com/srivatsa-dotcom/cleanscan/releases/tag/android-latest
 # On failure the Gradle log is pushed to the `ci-logs` branch (build.log) for debugging.
 name: Android APK
@@ -7,7 +7,6 @@ name: Android APK
 on:
   push:
     branches: [main, "feature/**"]
-    paths: ["android/**", "tools/app-logic-test/**", ".github/workflows/android.yml"]
   pull_request:
     paths: ["android/**", "tools/app-logic-test/**", ".github/workflows/android.yml"]
   workflow_dispatch:
@@ -43,12 +42,32 @@ jobs:
           # the pipeline's tests read this fixture: it must match what the app writes
           diff -r /tmp/fixture pipeline/tests/data/app_fixture
 
-      - name: Build debug APK
+      - name: Build APK
         working-directory: android
+        env:
+          # optional repository secrets: a release keystore gives a stable signature, so updates
+          # install over the previous version (debug keys change with every CI runner)
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          CLEANSCAN_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          CLEANSCAN_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          CLEANSCAN_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee ../build.log
-          exit ${PIPESTATUS[0]}
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            export CLEANSCAN_KEYSTORE="$RUNNER_TEMP/release.jks"
+            TASK="assembleDebug assembleRelease"
+          else
+            TASK=assembleDebug
+          fi
+          ./gradlew $TASK --no-daemon --stacktrace 2>&1 | tee ../build.log
+          status=${PIPESTATUS[0]}
+          if [ -f app/build/outputs/apk/release/app-release.apk ]; then
+            cp app/build/outputs/apk/release/app-release.apk ../CleanScan.apk
+          else
+            cp app/build/outputs/apk/debug/app-debug.apk ../CleanScan.apk
+          fi
+          exit $status
 
       - name: Publish APK as release "android-latest"
         # branches and pull requests only build; releases come from main
@@ -56,12 +75,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp android/app/build/outputs/apk/debug/app-debug.apk CleanScan-debug.apk
+          cp android/app/build/outputs/apk/debug/app-debug.apk CleanScan-debug.apk  # old name, old links
           gh release delete android-latest --yes --cleanup-tag || true
           gh release create android-latest CleanScan-debug.apk \
             --prerelease \
             --title "CleanScan Android - latest test build" \
             --notes "Debug build of ${GITHUB_SHA::7}. Download CleanScan-debug.apk on an ARCore Depth phone, allow installing unknown apps, and open it. See the README for how to process scans."
+
+      - name: Publish to the "latest" release
+        if: github.ref == 'refs/heads/main'
+        uses: ./.github/actions/publish-latest
+        with:
+          files: CleanScan.apk
+          token: ${{ github.token }}
 
       - name: Save build log to the ci-logs branch
         if: failure()

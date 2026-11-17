@@ -11,6 +11,15 @@ Data packets (binary):
   then ``count`` x (f32 dt, f32 angle_rad, f32 range_m, u8 intensity)    [13 bytes each]
   reading time on the rig clock = t_base + dt
 
+Depth frames (clip-on depth module: ESP32-S3 + MaixSense A010, or a Pi + Arducam ToF), one
+frame split into chunks that fit a Wi-Fi MTU:
+  magic "CSD1" | u8 kind (3 = depth) | u8 format (1 = u16 millimetres) | u16 width | u16 height
+  | u32 frame_id | u16 chunk | u16 n_chunks | f64 t_capture (module clock)
+  then up to MAX_DEPTH_PAYLOAD bytes: the frame's pixels (row-major) from offset
+  chunk * MAX_DEPTH_PAYLOAD. A depth module answers "hello" with
+  {"op": "info", "sensor": "a010", "kind": "depth", "width": 100, "height": 100,
+   "fov_deg": [70, 60], "version": 1}.
+
 The app converts rig time to its own clock with the NTP-style estimate from the
 ping exchange that had the smallest round trip: offset = t2 - (t1 + t3) / 2.
 """
@@ -54,6 +63,61 @@ def decode_points(packet: bytes) -> tuple[str, list[Reading]]:
         dt, ang, rng, inten = POINT.unpack_from(packet, HEADER.size + k * POINT.size)
         out.append(Reading(t_base + dt, ang, rng, inten))
     return CODE_KIND[kind], out
+
+
+DEPTH_MAGIC = b"CSD1"
+DEPTH_HEADER = struct.Struct("<4sBBHHIHHd")
+MAX_DEPTH_PAYLOAD = 1400 - DEPTH_HEADER.size - ((1400 - DEPTH_HEADER.size) % 2)  # whole u16 pixels
+
+
+def encode_depth_frame(frame_id: int, t_capture: float, width: int, height: int,
+                       depth_mm) -> list[bytes]:
+    """One depth frame (iterable of u16 millimetres, row-major) -> UDP packets."""
+    import array
+
+    px = array.array("H", depth_mm)
+    if len(px) != width * height:
+        raise ValueError("depth frame size does not match width x height")
+    if struct.pack("=H", 1) != struct.pack("<H", 1):
+        px.byteswap()
+    data = px.tobytes()
+    n = max(1, -(-len(data) // MAX_DEPTH_PAYLOAD))
+    return [DEPTH_HEADER.pack(DEPTH_MAGIC, 3, 1, width, height, frame_id & 0xFFFFFFFF, k, n, t_capture)
+            + data[k * MAX_DEPTH_PAYLOAD:(k + 1) * MAX_DEPTH_PAYLOAD] for k in range(n)]
+
+
+class DepthAssembler:
+    """Reassembles depth frames from chunks (any order); incomplete frames are dropped when a
+    newer frame completes or after ``keep`` newer frames started."""
+
+    def __init__(self, keep: int = 4) -> None:
+        self.parts: dict[int, dict] = {}
+        self.keep = keep
+        self.dropped = 0
+
+    def feed(self, packet: bytes):
+        """Returns (frame_id, t_capture, width, height, list[int] mm) when a frame completes."""
+        magic, kind, fmt, w, h, fid, k, n, t = DEPTH_HEADER.unpack_from(packet, 0)
+        if magic != DEPTH_MAGIC or kind != 3 or fmt != 1:
+            raise ValueError("not a CleanScan depth packet")
+        f = self.parts.setdefault(fid, {"n": n, "t": t, "w": w, "h": h, "chunks": {}})
+        f["chunks"][k] = packet[DEPTH_HEADER.size:]
+        if len(self.parts) > self.keep:  # oldest unfinished frames are lost on the air
+            for old in sorted(self.parts)[: len(self.parts) - self.keep]:
+                if old != fid:
+                    del self.parts[old]
+                    self.dropped += 1
+        if len(f["chunks"]) < n:
+            return None
+        data = b"".join(f["chunks"][i] for i in range(n))
+        del self.parts[fid]
+        for old in [i for i in self.parts if i < fid]:
+            del self.parts[old]
+            self.dropped += 1
+        if len(data) != 2 * w * h:
+            self.dropped += 1
+            return None
+        return fid, t, w, h, list(struct.unpack(f"<{w * h}H", data))
 
 
 def encode_json(obj: dict) -> bytes:

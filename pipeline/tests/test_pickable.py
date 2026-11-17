@@ -47,7 +47,8 @@ def test_bottles_pose_and_mass(scene):
 def test_room_is_carved_and_scene_validates(scene):
     _, out, rep = scene
     assert rep["room"]["triangles_carved"] > 0
-    assert {s["object"] for s in rep["supports"]} == {"bottle_a_2", "bottle_b_3"}
+    # every pickable gets a support patch (the glass is a pickable too)
+    assert {s["object"] for s in rep["supports"]} == {"bottle_a_2", "bottle_b_3", "glass_4"}
     assert not [w for w in rep["warnings"] if "bottle" in w]
     res = validate(out)
     assert res["ok"], json.dumps(res, indent=1)[:2000]

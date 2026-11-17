@@ -60,17 +60,20 @@ class _Assets:
         mtl = (self.scene_dir / obj_path).with_suffix(".mtl")
         if not mtl.exists():
             return None
-        tex, rgba = None, "0.7 0.7 0.7 1"
+        tex, kd, alpha = None, "0.7 0.7 0.7", "1"
         for line in mtl.read_text().splitlines():
             parts = line.split()
             if parts[:1] == ["map_Kd"]:
                 tex = str(Path(obj_path).parent / parts[1])
             elif parts[:1] == ["Kd"]:
-                rgba = " ".join(parts[1:4]) + " 1"
+                kd = " ".join(parts[1:4])
+            elif parts[:1] == ["d"]:
+                alpha = parts[1]
+        rgba = f"{kd} {alpha}"
         name = _safe(name)
         if tex:
             self.lines.append(f'    <texture name="{name}_tex" type="2d" file={quoteattr(self.rel(tex))}/>')
-            self.lines.append(f'    <material name="{name}" texture="{name}_tex" rgba="1 1 1 1"/>')
+            self.lines.append(f'    <material name="{name}" texture="{name}_tex" rgba="1 1 1 {alpha}"/>')
         else:
             self.lines.append(f'    <material name="{name}" rgba="{rgba}"/>')
         return name

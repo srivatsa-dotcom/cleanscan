@@ -20,12 +20,13 @@ import open3d as o3d
 from . import physics
 from .pipeline import PipelineConfig, export_room, reconstruct_room
 from .scene import (Joint, Scene, SceneObject, load_scene, make_link, pose_from_dict,
-                    carve_room, drop_boxes_in_hulls, object_hulls_world, read_obj_vf, room_collision_boxes,
+                    carve_room, clamp_link_above, drop_boxes_in_hulls, object_hulls_world, read_obj_vf, room_collision_boxes,
                     save_scene, support_heights, support_patch)
 
 if TYPE_CHECKING:
     from .articulated import ArticulatedConfig
     from .pickable import PickableConfig
+    from .transparent import TransparentConfig
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +35,12 @@ def _pickable_cfg():
     from .pickable import PickableConfig
 
     return PickableConfig()
+
+
+def _transparent_cfg():
+    from .transparent import TransparentConfig
+
+    return TransparentConfig()
 
 
 def _articulated_cfg():
@@ -51,6 +58,7 @@ class RLConfig:
     collision_quality: str = "fast"  # fast | best (CoACD presets)
     pickable: "PickableConfig" = field(default_factory=lambda: _pickable_cfg())
     articulated: "ArticulatedConfig" = field(default_factory=lambda: _articulated_cfg())
+    transparent: "TransparentConfig" = field(default_factory=lambda: _transparent_cfg())
     room_box_voxel: float = 0.04  # MuJoCo room collision boxes
     declared_objects: str | None = None  # JSON file of objects given by hand (see below)
     objects: str = "auto"  # auto: from the app's selection | none | truth (synthetic tests only)
@@ -82,7 +90,7 @@ def build_object(scene_dir: Path, obj_id: str, cls: str, type_: str, pose: np.nd
         lk, li = make_link(scene_dir, rel, ld["name"], np.asarray(ld["V"]), np.asarray(ld["F"]), spec,
                            colors=ld.get("colors"), textured=ld.get("textured"),
                            decomposition=cfg.decomposition, max_hulls=cfg.max_hulls,
-                           quality=cfg.collision_quality)
+                           quality=cfg.collision_quality, opacity=ld.get("opacity", 1.0))
         built.append(lk)
         link_info[ld["name"]] = li
     js = []
@@ -147,8 +155,13 @@ def objects_from_selection(session_dir: Path, room, scene_dir: Path, table: dict
             if obj is not None:
                 out.append(obj)
             continue
+        if s.mode == "transparent":
+            obj = _transparent_object(s, Path(session_dir), room, scene_dir, table, cfg, info, warnings, heights)
+            if obj is not None:
+                out.append(obj)
+            continue
         if s.mode != "pickable":
-            warnings.append(f"{s.slug}: {s.mode} objects are not supported yet; left in the static room")
+            warnings.append(f"{s.slug}: unknown mode {s.mode!r}; left in the static room")
             continue
         cap = s.captures.get("scan")
         cap_dir = Path(session_dir) / cap if cap else None
@@ -182,6 +195,39 @@ def objects_from_selection(session_dir: Path, room, scene_dir: Path, table: dict
                                 [{"name": "base", "V": V, "F": F, "textured": textured}], None, table, cfg,
                                 name=s.name, info=info))
     return out
+
+
+def _transparent_object(s, session_dir: Path, room, scene_dir: Path, table: dict, cfg: RLConfig,
+                        info: dict, warnings: list[str], heights: np.ndarray) -> SceneObject | None:
+    from . import pickable, transparent
+    from .session import Session
+
+    caps = {k: session_dir / v for k, v in s.captures.items()}
+    prof = caps.get("profile")
+    if prof is None or not (prof / "session.json").exists():
+        warnings.append(f"{s.slug}: no side-profile capture; left in the static room")
+        return None
+    top = caps.get("top")
+    top_ses = Session.load(top) if top is not None and (top / "session.json").exists() else None
+    try:
+        res = transparent.reconstruct_transparent(Session.load(prof), top_ses, cfg.transparent)
+    except Exception as exc:  # noqa: BLE001
+        warnings.append(f"{s.slug}: silhouette reconstruction failed ({exc}); left in the static room")
+        return None
+    pose = room.T @ res.T_capture_object
+    pose, dz = pickable.settle(pose, res.V, heights)
+    info = {**info, "reconstruction": res.info, "shape": res.info["shape"], "settle_dz_m": round(dz, 4),
+            "profile_r_z": np.round(res.profile, 4).tolist()}
+    if res.info["shape"].startswith("cylinder"):
+        warnings.append(f"{s.slug}: glass profile unreliable, using a cylinder")
+    tv, sv = res.info.get("top_view_rim_radius_m"), res.info.get("rim_radius_side_m")
+    if tv and sv and abs(tv - sv) > 0.2 * sv:
+        warnings.append(f"{s.slug}: rim radius from the top view ({tv * 100:.1f} cm) and the side "
+                        f"({sv * 100:.1f} cm) disagree")
+    # (the silhouette never sees the glass's wall thickness; materials.yaml gives it)
+    return build_object(scene_dir, s.slug, s.cls, "pickable", pose,
+                        [{"name": "base", "V": res.V, "F": res.F, "colors": np.array([[0.85, 0.92, 0.95]]),
+                          "opacity": 0.35}], None, table, cfg, name=s.name, info=info)
 
 
 DRAWER_PARENTS = {"cupboard", "cabinet", "dresser", "desk", "kitchen cabinet", "chest of drawers"}
@@ -230,8 +276,13 @@ def _articulated_object(s, session_dir: Path, room, scene_dir: Path, table: dict
     info = {**info, **res.info, "shape": "scanned"}
     if res.info.get("inferred_drawer_depth", {}).get("extended_m"):
         warnings.append(f"{s.slug}: hidden drawer depth inferred ({res.info['inferred_drawer_depth']['extended_m']} m)")
-    return build_object(scene_dir, s.slug, s.cls, "articulated", room.T @ res.A, links, [j], table, cfg,
-                        name=s.name, info=info)
+    obj = build_object(scene_dir, s.slug, s.cls, "articulated", room.T @ res.A, links, [j], table, cfg,
+                       name=s.name, info=info)
+    # convex pieces of a door can dip below the floor by a few mm (smoothing, decomposition)
+    lifted = clamp_link_above(scene_dir, obj, part_name, cfg.articulated.part_floor_clearance / 2)
+    if lifted:
+        obj.info["collision_lifted_off_floor_m"] = round(lifted, 4)
+    return obj
 
 
 # --------------------------------------------------------------------------- export

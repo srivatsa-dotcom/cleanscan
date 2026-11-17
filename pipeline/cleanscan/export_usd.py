@@ -68,9 +68,9 @@ def _rot_x_to(axis) -> np.ndarray:
     return rot.as_matrix()
 
 
-def _mtl_texture(obj_path: Path) -> tuple[Path | None, list[float]]:
+def _mtl_texture(obj_path: Path) -> tuple[Path | None, list[float], float]:
     mtl = obj_path.with_suffix(".mtl")
-    tex, kd = None, [0.7, 0.7, 0.7]
+    tex, kd, d = None, [0.7, 0.7, 0.7], 1.0
     if mtl.exists():
         for line in mtl.read_text().splitlines():
             p = line.split()
@@ -78,7 +78,9 @@ def _mtl_texture(obj_path: Path) -> tuple[Path | None, list[float]]:
                 tex = obj_path.parent / p[1]
             elif p[:1] == ["Kd"]:
                 kd = [float(v) for v in p[1:4]]
-    return tex, kd
+            elif p[:1] == ["d"]:
+                d = float(p[1])
+    return tex, kd, d
 
 
 def write_mesh_layer(path: Path, V: np.ndarray, F: np.ndarray, uvs: np.ndarray | None = None) -> None:
@@ -117,12 +119,14 @@ class _Writer:
         if name in self.look_names:
             return f"/World/Looks/{name}"
         self.look_names.add(name)
-        tex, kd = _mtl_texture(obj_path)
+        tex, kd, opacity = _mtl_texture(obj_path)
         m = [f'        def Material "{name}"', "        {",
              f"            token outputs:surface.connect = </World/Looks/{name}/surface.outputs:surface>",
              '            def Shader "surface"', "            {",
              '                uniform token info:id = "UsdPreviewSurface"',
-             "                float inputs:roughness = 0.8"]
+             "                float inputs:roughness = 0.8" if opacity >= 1 else "                float inputs:roughness = 0.05"]
+        if opacity < 1:
+            m += [f"                float inputs:opacity = {opacity:.3g}", "                float inputs:ior = 1.5"]
         if tex is not None and tex.exists():
             m += [f"                color3f inputs:diffuseColor.connect = </World/Looks/{name}/tex.outputs:rgb>",
                   "                token outputs:surface", "            }",

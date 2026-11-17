@@ -226,33 +226,35 @@ def read_obj_vf(path: Path) -> tuple[np.ndarray, np.ndarray]:
 
 
 def write_visual(path: Path, V: np.ndarray, F: np.ndarray, colors: np.ndarray | None = None,
-                 textured=None) -> None:
+                 textured=None, opacity: float = 1.0) -> None:
     """Visual OBJ: textured (``textured`` = texture.TexturedMesh in the object frame), else
     vertex-coloured mesh baked into a small texture-less MTL colour."""
     from .gazebo import write_obj
 
+    mtl = Path(path).with_suffix(".mtl")
     if textured is not None:
         write_obj(path, textured)
-        return
-    m = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(V), o3d.utility.Vector3iVector(F))
-    write_obj(path, None, m)
-    if colors is not None and len(colors):
-        c = np.clip(np.asarray(colors).reshape(-1, 3).mean(0), 0, 1)
-        mtl = Path(path).with_suffix(".mtl")
-        mtl.write_text(mtl.read_text().replace("Kd 0.7 0.7 0.7", f"Kd {c[0]:.3f} {c[1]:.3f} {c[2]:.3f}"))
+    else:
+        m = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(V), o3d.utility.Vector3iVector(F))
+        write_obj(path, None, m)
+        if colors is not None and len(colors):
+            c = np.clip(np.asarray(colors).reshape(-1, 3).mean(0), 0, 1)
+            mtl.write_text(mtl.read_text().replace("Kd 0.7 0.7 0.7", f"Kd {c[0]:.3f} {c[1]:.3f} {c[2]:.3f}"))
+    if opacity < 1.0:  # glass: MTL dissolve, read by the MJCF and USD exporters
+        mtl.write_text(mtl.read_text().replace("d 1.0", f"d {opacity:.2f}"))
 
 
 def make_link(scene_dir: Path, rel_dir: str, name: str, V: np.ndarray, F: np.ndarray,
               spec: physics.PhysicsSpec, colors: np.ndarray | None = None, textured=None,
               decomposition: str = "auto", max_hulls: int = 16,
-              quality: str = "fast") -> tuple[Link, dict]:
+              quality: str = "fast", opacity: float = 1.0) -> tuple[Link, dict]:
     """Write a link's visual + convex collision pieces under ``scene_dir/rel_dir`` and
     compute its mass properties. ``V``/``F``: watertight mesh in the object frame.
     Returns (link, info for the report)."""
     scene_dir = Path(scene_dir)
     d = scene_dir / rel_dir
     (d / "collision").mkdir(parents=True, exist_ok=True)
-    write_visual(d / "visual.obj", V, F, colors, textured)
+    write_visual(d / "visual.obj", V, F, colors, textured, opacity)
     pieces, method = physics.convex_decomposition(V, F, decomposition, max_hulls=max_hulls, quality=quality)
     coll = []
     for i, (pv, pf) in enumerate(pieces):
@@ -445,3 +447,24 @@ def drop_boxes_in_hulls(boxes: list[dict], hulls: list, margin: float = 0.005) -
     if len(keep) < len(boxes):
         log.info("dropped %d room boxes overlapping objects", len(boxes) - len(keep))
     return keep
+
+
+def clamp_link_above(scene_dir: Path, o: SceneObject, link_name: str, z_min: float) -> float:
+    """Keep a link's collision pieces above ``z_min`` (world, rest pose): each convex piece's
+    vertices are lifted to the plane and the hull rebuilt (still convex). Returns how far the
+    lowest point was lifted (0 if nothing changed). Used for doors near the floor."""
+    lk = o.link(link_name)
+    R, t = o.pose[:3, :3], o.pose[:3, 3]
+    lifted = 0.0
+    for c in lk.collision:
+        V, _ = read_obj_vf(Path(scene_dir) / c)
+        W = V @ R.T + t
+        low = W[:, 2] < z_min
+        if not low.any():
+            continue
+        lifted = max(lifted, float(z_min - W[:, 2].min()))
+        W[low, 2] = z_min
+        Vo = (W - t) @ R
+        pv, pf = physics.convex_hull(Vo)
+        write_plain_obj(Path(scene_dir) / c, pv, pf)
+    return lifted

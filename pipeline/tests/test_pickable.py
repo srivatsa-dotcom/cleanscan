@@ -7,10 +7,7 @@ import open3d as o3d
 import pytest
 
 from cleanscan import physics
-from cleanscan.fusion import FusionConfig
 from cleanscan.pickable import PickableConfig, fallback_primitive, reconstruct_pickable, register_to_room
-from cleanscan.pipeline import PipelineConfig
-from cleanscan.rl import RLConfig, process_rl
 from cleanscan.scene import read_obj_vf
 from cleanscan.session import Session
 from cleanscan.synthetic_kitchen import load_truth
@@ -20,12 +17,8 @@ pytest.importorskip("mujoco")
 
 
 @pytest.fixture(scope="module")
-def scene(tmp_path_factory, kitchen_session):
-    out = tmp_path_factory.mktemp("pickable") / "scene"
-    cfg = RLConfig(pipeline=PipelineConfig(name="kitchen", texture_mode="none",
-                                           fusion=FusionConfig(voxel_size=0.03)), zip=False)
-    rep = process_rl(kitchen_session, out, cfg)
-    return kitchen_session, out, rep
+def scene(kitchen_scene):
+    return kitchen_scene
 
 
 def _truth(ses):
@@ -56,8 +49,6 @@ def test_room_is_carved_and_scene_validates(scene):
     assert rep["room"]["triangles_carved"] > 0
     assert {s["object"] for s in rep["supports"]} == {"bottle_a_2", "bottle_b_3"}
     assert not [w for w in rep["warnings"] if "bottle" in w]
-    # objects that are not handled yet are reported, not silently dropped
-    assert any("fridge" in w for w in rep["warnings"])
     res = validate(out)
     assert res["ok"], json.dumps(res, indent=1)[:2000]
 

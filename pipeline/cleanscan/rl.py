@@ -12,14 +12,20 @@ import shutil
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
+import open3d as o3d
 
 from . import physics
 from .pipeline import PipelineConfig, export_room, reconstruct_room
 from .scene import (Joint, Scene, SceneObject, load_scene, make_link, pose_from_dict,
                     carve_room, drop_boxes_in_hulls, object_hulls_world, read_obj_vf, room_collision_boxes,
                     save_scene, support_heights, support_patch)
+
+if TYPE_CHECKING:
+    from .articulated import ArticulatedConfig
+    from .pickable import PickableConfig
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +36,12 @@ def _pickable_cfg():
     return PickableConfig()
 
 
+def _articulated_cfg():
+    from .articulated import ArticulatedConfig
+
+    return ArticulatedConfig()
+
+
 @dataclass
 class RLConfig:
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
@@ -38,6 +50,7 @@ class RLConfig:
     max_hulls: int = 16
     collision_quality: str = "fast"  # fast | best (CoACD presets)
     pickable: "PickableConfig" = field(default_factory=lambda: _pickable_cfg())
+    articulated: "ArticulatedConfig" = field(default_factory=lambda: _articulated_cfg())
     room_box_voxel: float = 0.04  # MuJoCo room collision boxes
     declared_objects: str | None = None  # JSON file of objects given by hand (see below)
     objects: str = "auto"  # auto: from the app's selection | none | truth (synthetic tests only)
@@ -129,6 +142,11 @@ def objects_from_selection(session_dir: Path, room, scene_dir: Path, table: dict
     out = []
     for s in selected:
         info = {"source": s.source, "mode": s.mode, "selection_id": s.id, **s.info}
+        if s.mode == "articulated":
+            obj = _articulated_object(s, Path(session_dir), room, scene_dir, table, cfg, info, warnings)
+            if obj is not None:
+                out.append(obj)
+            continue
         if s.mode != "pickable":
             warnings.append(f"{s.slug}: {s.mode} objects are not supported yet; left in the static room")
             continue
@@ -164,6 +182,56 @@ def objects_from_selection(session_dir: Path, room, scene_dir: Path, table: dict
                                 [{"name": "base", "V": V, "F": F, "textured": textured}], None, table, cfg,
                                 name=s.name, info=info))
     return out
+
+
+DRAWER_PARENTS = {"cupboard", "cabinet", "dresser", "desk", "kitchen cabinet", "chest of drawers"}
+
+
+def _articulated_object(s, session_dir: Path, room, scene_dir: Path, table: dict, cfg: RLConfig,
+                        info: dict, warnings: list[str]) -> SceneObject | None:
+    from . import articulated
+    from .session import Session
+    from .texture import TextureConfig, bake_texture
+
+    caps = {k: session_dir / v for k, v in s.captures.items()}
+    if not all(k in caps and (caps[k] / "session.json").exists() for k in ("closed", "open")):
+        warnings.append(f"{s.slug}: needs a closed and an open capture; left in the static room")
+        return None
+    Tinv = np.linalg.inv(room.T)
+    region_c = None if s.region is None else s.region @ Tinv[:3, :3].T + Tinv[:3, 3]
+    anchor = s.region.mean(0) if s.region is not None else (
+        room.T[:3, :3] @ s.seed_world + room.T[:3, 3] if s.seed_world is not None else np.zeros(3))
+    floor_y = float((Tinv @ np.array([anchor[0], anchor[1], 0.0, 1.0]))[1])
+    closed, opened = Session.load(caps["closed"]), Session.load(caps["open"])
+    try:
+        res = articulated.reconstruct_articulated(closed, opened, room.session, floor_y, region_c, cfg.articulated)
+    except Exception as exc:  # noqa: BLE001
+        warnings.append(f"{s.slug}: articulation could not be recovered ({exc}); left in the static room")
+        return None
+    j = dict(res.joint)
+    part_name = "door" if j["type"] == "revolute" else "drawer"
+    part_class = "drawer" if j["type"] == "prismatic" and s.cls.lower() in DRAWER_PARENTS else s.cls
+    j["child"] = part_name
+    textures = {}
+    for name, (V, F) in (("body", res.body), (part_name, res.part)):
+        try:
+            m = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(V @ res.A[:3, :3].T + res.A[:3, 3]),
+                                          o3d.utility.Vector3iVector(F))
+            m.compute_vertex_normals()
+            tm = bake_texture(closed, m, TextureConfig(size=cfg.articulated.texture_size, max_keyframes=12), None)
+            from .pipeline import transform_textured
+
+            textures[name] = transform_textured(tm, np.linalg.inv(res.A))
+        except Exception as exc:  # noqa: BLE001 - texture is cosmetic
+            log.warning("texture for %s/%s failed: %s", s.slug, name, exc)
+    links = [{"name": "body", "V": res.body[0], "F": res.body[1], "class": s.cls, "textured": textures.get("body")},
+             {"name": part_name, "V": res.part[0], "F": res.part[1], "class": part_class,
+              "textured": textures.get(part_name)}]
+    info = {**info, **res.info, "shape": "scanned"}
+    if res.info.get("inferred_drawer_depth", {}).get("extended_m"):
+        warnings.append(f"{s.slug}: hidden drawer depth inferred ({res.info['inferred_drawer_depth']['extended_m']} m)")
+    return build_object(scene_dir, s.slug, s.cls, "articulated", room.T @ res.A, links, [j], table, cfg,
+                        name=s.name, info=info)
 
 
 # --------------------------------------------------------------------------- export

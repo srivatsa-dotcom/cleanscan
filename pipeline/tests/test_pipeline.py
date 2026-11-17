@@ -74,6 +74,22 @@ def test_gazebo_files(masked_run):
     assert "map_Kd visual_texture.png" in (model / "meshes" / "visual.mtl").read_text()
 
 
+def test_process_output_unchanged(masked_run):
+    """`cleanscan process` keeps writing exactly the files it always wrote."""
+    out, rep = masked_run
+    files = sorted(str(p.relative_to(out)) for p in out.rglob("*") if p.is_file())
+    assert files == sorted([
+        "report.json", "room_mesh.ply", "run_gazebo.sh", "maps/room.pgm", "maps/room.yaml",
+        "models/room/model.config", "models/room/model.sdf", "models/room/meshes/collision.stl",
+        "models/room/meshes/visual.mtl", "models/room/meshes/visual.obj",
+        "models/room/meshes/visual_texture.png", "worlds/room.sdf", "worlds/room.world"])
+    assert set(rep) == {"name", "frames", "depth_source", "rig", "platform", "triangles_visual",
+                        "triangles_collision", "ghost_triangles_removed", "extent_m",
+                        "transform_capture_to_gazebo", "seconds", "outputs", "config"}
+    world = (out / "worlds" / "room.sdf").read_text()
+    assert world.count("<include>") == 1 and "floor_collision" in world
+
+
 def test_occupancy_map(masked_run):
     out, _ = masked_run
     yaml = (out / "maps" / "room.yaml").read_text()

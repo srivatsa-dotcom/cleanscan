@@ -2,6 +2,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- clip-on depth module over Wi-Fi (module/README.md) -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-feature android:name="android.hardware.camera.ar" android:required="true" />
     <uses-feature android:glEsVersion="0x00020000" android:required="true" />
 
@@ -12,6 +16,8 @@
 
         <!-- ARCore is required (the app is useless without it) -->
         <meta-data android:name="com.google.ar.core" android:value="required" />
+        <!-- segmentation model file in assets/ (app/build.gradle.kts: cleanscan.segModel) -->
+        <meta-data android:name="com.cleanscan.segModel" android:value="${segModel}" />
 
         <activity
             android:name=".MainActivity"

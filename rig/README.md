@@ -58,6 +58,15 @@ Both sensors use 3.3 V logic on their TX line, so they connect directly to the P
 * It must be **rigid**: if the LiDAR can move relative to the phone, the scan smears.
 * Keep the LiDAR's view clear of your hand and the phone where possible.
 
+## Depth-module variant: Arducam ToF on the Pi
+
+The same Pi can be a **depth module** instead of a LiDAR rig: an Arducam ToF camera (240 x 180,
+CSI) streams depth images the way the ESP32-S3 + A010 module does (module/README.md).
+Run the setup with `sudo ./setup/install.sh arducam_tof`, then in the app turn on
+**External depth module** (not the LiDAR rig) and use address `10.42.0.1`. Try it without
+hardware with `cleanscan-rig --sensor simdepth`. The Arducam SDK calls follow Arducam's
+examples and have not been tested on hardware.
+
 ## Pi setup (once)
 
 1. Flash **Raspberry Pi OS Lite (Bookworm)** with Raspberry Pi Imager; in its settings set

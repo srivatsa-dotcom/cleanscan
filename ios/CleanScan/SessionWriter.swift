@@ -22,10 +22,25 @@ final class SessionWriter {
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyyMMdd-HHmmss"
         let dir = scansDirectory.appendingPathComponent("Scan-\(fmt.string(from: Date()))", isDirectory: true)
-        return try SessionWriter(directory: dir, depthSource: depthSource)
+        return try SessionWriter(directory: dir, depthSource: depthSource, extensions: ["objects"])
     }
 
-    private init(directory: URL, depthSource: String) throws {
+    /// A guided object capture inside a scan: Scan-.../captures/<id>/<stage>/ (a full session).
+    static func createCapture(scan: URL, relative: String, depthSource: String) throws -> SessionWriter {
+        try SessionWriter(directory: scan.appendingPathComponent(relative, isDirectory: true), depthSource: depthSource)
+    }
+
+    /// Number of frames written so far (= index of the next frame).
+    var frameIndex: Int { index }
+
+    /// A small file next to the session (tracks.json, selection.json, thumbs/...).
+    func writeFile(_ relative: String, data: Data) {
+        let url = directory.appendingPathComponent(relative)
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: url)
+    }
+
+    private init(directory: URL, depthSource: String, extensions: [String] = []) throws {
         self.directory = directory
         let fm = FileManager.default
         for sub in ["color", "depth", "confidence", "mask"] {
@@ -41,6 +56,7 @@ final class SessionWriter {
             "world_up": "y",
             "camera_convention": "opengl",
             "depth_source": depthSource,
+            "extensions": extensions,
         ]
         try JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted, .sortedKeys])
             .write(to: directory.appendingPathComponent("session.json"))
@@ -49,7 +65,10 @@ final class SessionWriter {
         framesHandle = try FileHandle(forWritingTo: framesURL)
     }
 
-    func write(_ f: CapturedFrame, mask: LivingMask) throws {
+    /// - Parameters:
+    ///   - instances: 16-bit object labels (track ids) at depth resolution (room pass)
+    ///   - objectMask: 0/255 mask of the object being captured (guided captures)
+    func write(_ f: CapturedFrame, mask: LivingMask, instances: [UInt16]? = nil, objectMask: [UInt8]? = nil) throws {
         let name = String(format: "%06d", index)
         let (dw, dh) = f.depthSize
 
@@ -98,6 +117,20 @@ final class SessionWriter {
 
         try writePNG8(mask.pixels, width: mask.width, height: mask.height,
                       to: directory.appendingPathComponent("mask/\(name).png"))
+        var instancesPath: String?
+        if let instances {
+            try FileManager.default.createDirectory(at: directory.appendingPathComponent("instances"),
+                                                    withIntermediateDirectories: true)
+            try writePNG16(instances, width: dw, height: dh, to: directory.appendingPathComponent("instances/\(name).png"))
+            instancesPath = "instances/\(name).png"
+        }
+        var objectMaskPath: String?
+        if let objectMask {
+            try FileManager.default.createDirectory(at: directory.appendingPathComponent("object_mask"),
+                                                    withIntermediateDirectories: true)
+            try writePNG8(objectMask, width: dw, height: dh, to: directory.appendingPathComponent("object_mask/\(name).png"))
+            objectMaskPath = "object_mask/\(name).png"
+        }
 
         // intrinsics are given for the captured image; scale them to the depth map
         let K = f.intrinsics
@@ -120,6 +153,8 @@ final class SessionWriter {
         ]
         if let depthPath { rec["depth"] = depthPath }
         if let confPath { rec["confidence"] = confPath }
+        if let instancesPath { rec["instances"] = instancesPath }
+        if let objectMaskPath { rec["object_mask"] = objectMaskPath }
         var line = try JSONSerialization.data(withJSONObject: rec, options: [.sortedKeys])
         line.append(0x0A)
         try framesHandle.write(contentsOf: line)

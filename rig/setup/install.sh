@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-time setup of a Raspberry Pi Zero W / Zero 2 W as a CleanScan LiDAR rig.
 # Raspberry Pi OS Bookworm (Lite is enough). Run from the rig/ folder:
-#     sudo ./setup/install.sh ld06            # or: ld19, tfluna, tfmini
+#     sudo ./setup/install.sh ld06            # or: ld19, tfluna, tfmini, arducam_tof
 # Then reboot. The Pi creates the Wi-Fi network "CleanScanRig" (password below) and
 # streams the LiDAR to the app on 10.42.0.1:5600.
 set -euo pipefail
@@ -20,6 +20,13 @@ apt-get install -y python3-venv python3-serial network-manager
 echo "== Python package"
 python3 -m venv --system-site-packages /opt/cleanscan-rig
 /opt/cleanscan-rig/bin/pip install --no-deps "$HERE"
+
+if [ "$SENSOR" = "arducam_tof" ]; then
+  echo "== Arducam ToF camera (depth module variant; check Arducam's licence for its SDK)"
+  CONFIG=/boot/firmware/config.txt; [ -f "$CONFIG" ] || CONFIG=/boot/config.txt
+  grep -q '^dtoverlay=arducam-pivariety' "$CONFIG" || echo 'dtoverlay=arducam-pivariety' >> "$CONFIG"
+  /opt/cleanscan-rig/bin/pip install ArducamDepthCamera numpy
+fi
 
 echo "== serial port: hardware UART on GPIO14/15, no login console"
 raspi-config nonint do_serial_cons 1   # disable the serial login console

@@ -15,25 +15,40 @@ import java.nio.channels.FileChannel
  * app/src/main/assets/living_seg.tflite (see tools/export_models.py).
  */
 class LivingSegmenter(context: Context) {
+    /** Model file in assets/: manifest meta-data com.cleanscan.segModel (gradle property
+     * cleanscan.segModel), default living_seg.tflite. */
+    val modelName: String = try {
+        context.packageManager.getApplicationInfo(context.packageName, android.content.pm.PackageManager.GET_META_DATA)
+            .metaData?.getString("com.cleanscan.segModel") ?: MODEL
+    } catch (e: Exception) { MODEL }
+
     private val interpreter: Interpreter? = try {
-        val fd = context.assets.openFd(MODEL)
+        val fd = context.assets.openFd(modelName)
         val buf = FileInputStream(fd.fileDescriptor).channel
             .map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
         Interpreter(buf, Interpreter.Options().setNumThreads(4))
     } catch (e: Exception) {
-        Log.w(TAG, "no segmentation model ($MODEL): ${e.message}")
+        Log.w(TAG, "no segmentation model ($modelName): ${e.message}")
         null
     }
 
     val available get() = interpreter != null
 
+    /** People/animal mask plus the other objects the same model found (one inference). */
+    class Analysis(val livingMask: ByteArray, val objects: List<YoloSegDecoder.Detection>)
+
     /**
      * @param sensorImage camera image in sensor (landscape) orientation
      * @return mask (0 / 255) at depth resolution, depth image is also sensor-oriented
      */
-    fun segment(sensorImage: Bitmap, depthW: Int, depthH: Int): ByteArray {
+    fun segment(sensorImage: Bitmap, depthW: Int, depthH: Int): ByteArray =
+        analyze(sensorImage, depthW, depthH, detectObjects = false).livingMask
+
+    /** As [segment], and with [detectObjects] also returns non-living COCO detections
+     * (portrait-normalised boxes and masks) for object selection. */
+    fun analyze(sensorImage: Bitmap, depthW: Int, depthH: Int, detectObjects: Boolean): Analysis {
         val mask = ByteArray(depthW * depthH)
-        val tfl = interpreter ?: return mask
+        val tfl = interpreter ?: return Analysis(mask, emptyList())
         // Input is [1, 3, H, W] (LiteRT export) or [1, H, W, 3] (older TF exports).
         val layout = YoloSegDecoder.InputLayout.of(tfl.getInputTensor(0).shape())
 
@@ -64,10 +79,12 @@ class LivingSegmenter(context: Context) {
         val rawProto = FloatArray(protoBuf.capacity() / 4).also { protoBuf.asFloatBuffer().get(it) }
 
         val out = YoloSegDecoder.Outputs.of(dShape, rawDet, pShape, rawProto)
+        val classes = if (detectObjects) YoloSegDecoder.LIVING + OBJECT_CLASSES else YoloSegDecoder.LIVING
         val dets = YoloSegDecoder.decode(out.det, out.channels, out.anchors, out.proto, out.numMasks,
-            out.maskH, out.maskW, layout.width, layout.height)
-        YoloSegDecoder.rasterize(dets, depthW, depthH, mask)
-        return mask
+            out.maskH, out.maskW, layout.width, layout.height, classes = classes)
+        val living = dets.filter { it.classId in YoloSegDecoder.LIVING }
+        YoloSegDecoder.rasterize(living, depthW, depthH, mask)
+        return Analysis(mask, dets.filter { it.classId !in YoloSegDecoder.LIVING })
     }
 
     companion object {

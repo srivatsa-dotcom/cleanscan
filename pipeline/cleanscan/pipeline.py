@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import open3d as o3d
 
-from . import gazebo, ghosts, lidar, mesh as meshops, occupancy, stereo
+from . import depthmodule, gazebo, ghosts, lidar, mesh as meshops, occupancy, stereo
 from .fusion import FusionConfig, integrate
 from .masks import resegment_session
 from .session import Session
@@ -30,6 +30,9 @@ class PipelineConfig:
     lidar: lidar.LidarConfig = field(default_factory=lidar.LidarConfig)
     # With an external LiDAR on a phone without depth sensor, also fuse camera stereo depth?
     rig_stereo: bool = True
+    # Clip-on ToF module (tof.jsonl): use it on phones without a depth sensor
+    use_depth_module: bool = True
+    depth_module: depthmodule.DepthModuleConfig = field(default_factory=depthmodule.DepthModuleConfig)
     texture_mode: str = "photo"  # photo | none
     ghost_removal: bool = True
     ghost_min_votes: int = 3
@@ -57,17 +60,46 @@ def transform_textured(tm: TexturedMesh, T: np.ndarray) -> TexturedMesh:
     return TexturedMesh(tm.vertices @ R.T + T[:3, 3], tm.triangles, tm.uvs, tm.normals @ R.T, tm.texture)
 
 
-def run(session_dir: str | Path, out_dir: str | Path, cfg: PipelineConfig) -> dict:
+@dataclass
+class RoomResult:
+    """The reconstructed static room, before anything is written to disk.
+
+    ``aligned`` and ``textured`` are in the Gazebo/ROS frame (Z up, floor at z = 0);
+    ``T`` maps the phone's capture frame (Y up) to it."""
+
+    session: Session
+    aligned: o3d.geometry.TriangleMesh
+    textured: TexturedMesh | None
+    T: np.ndarray
+    cloud: object | None
+    camera_only: bool
+    use_frames: bool
+    n_ghost: int
+    dynamic_masks: dict | None
+    t0: float
+    depth_module: depthmodule.DepthModuleResult | None = None
+
+
+def reconstruct_room(session_dir: str | Path, cfg: PipelineConfig) -> RoomResult:
+    """Masked fusion + ghost removal + cleanup + floor alignment + texture (no files written)."""
     t0 = time.time()
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
     session = Session.load(session_dir)
     log.info("loaded %d frames from %s (%s)", len(session.frames), session_dir,
              session.meta.get("platform", "?"))
 
     camera_only = not session.has_sensor_depth
     use_frames = True
-    if camera_only and session.has_lidar and not cfg.rig_stereo and session.rig.get("kind", "2d") == "2d":
+    dm = None
+    if camera_only and cfg.use_depth_module and depthmodule.has_depth_module(session):
+        # the guided object captures (same clock and world) help the module calibration
+        caps = [Session.load(p.parent) for p in sorted(session.root.glob("captures/*/*/session.json"))]
+        T_cm, calib = depthmodule.calibrate_module(session, depthmodule.load_tof(session), cfg.depth_module,
+                                                   extra_sessions=caps)
+        log.info("phone without depth sensor + depth module: depth from the module, stereo beyond its range")
+        dm = depthmodule.estimate_session_depth(session, cfg.depth_module, T_cam_module=T_cm,
+                                                stereo_cfg=cfg.stereo)
+        dm.calibration = calib
+    elif camera_only and session.has_lidar and not cfg.rig_stereo and session.rig.get("kind", "2d") == "2d":
         use_frames = False
         log.info("external LiDAR only (camera stereo disabled)")
     elif camera_only:
@@ -120,13 +152,20 @@ def run(session_dir: str | Path, out_dir: str | Path, cfg: PipelineConfig) -> di
     aligned = copy.deepcopy(world_mesh).transform(T)
     aligned.compute_vertex_normals()
 
+    dyn = _merge_masks(masks, extra)
     textured = None
     if cfg.texture_mode == "photo":
-        dyn = _merge_masks(masks, extra)
         textured = transform_textured(bake_texture(session, world_mesh, cfg.texture, dyn or None), T)
+    return RoomResult(session, aligned, textured, T, cloud, camera_only, use_frames, n_ghost, dyn, t0, dm)
 
+
+def export_room(room: RoomResult, out_dir: str | Path, cfg: PipelineConfig) -> dict:
+    """Write the Gazebo model/worlds, nav map, PLY and report.json (the `process` output)."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    session, aligned, cloud, T = room.session, room.aligned, room.cloud, room.T
     collision = meshops.simplify(copy.deepcopy(aligned), cfg.max_collision_triangles)
-    files = gazebo.export_gazebo(out_dir, cfg.name, textured, aligned, collision)
+    files = gazebo.export_gazebo(out_dir, cfg.name, room.textured, aligned, collision)
 
     o3d.io.write_triangle_mesh(str(out_dir / f"{cfg.name}_mesh.ply"), aligned)
     (out_dir / "maps").mkdir(exist_ok=True)
@@ -138,23 +177,38 @@ def run(session_dir: str | Path, out_dir: str | Path, cfg: PipelineConfig) -> di
     report = {
         "name": cfg.name,
         "frames": len(session.frames),
-        "depth_source": ("sensor" if not camera_only else "stereo" if use_frames else "none")
+        "depth_source": ("sensor" if not room.camera_only
+                         else f"depth module ({depthmodule.module_info(session).get('sensor', '?')})"
+                         + (" + stereo fill" if room.depth_module and cfg.depth_module.stereo_fill else "")
+                         if room.depth_module is not None
+                         else "stereo" if room.use_frames else "none")
                         + (" + external LiDAR" if cloud is not None else ""),
         "rig": None if cloud is None else {
             "sensor": session.rig.get("sensor"), "kind": cloud.kind,
             "readings_used": int(cloud.keep.sum()), "readings_dropped": int((~cloud.keep).sum()),
             "calibration": cloud.calibration, "T_camera_lidar": cloud.T_cam_lidar.tolist(),
         },
+        **({"depth_module": {"sensor": depthmodule.module_info(session).get("sensor"),
+                             "T_camera_module": room.depth_module.T_cam_module.tolist(),
+                             "calibration": room.depth_module.calibration,
+                             "pixels_with_depth": round(room.depth_module.coverage, 3)}}
+           if room.depth_module is not None else {}),
         "platform": session.meta.get("platform"),
         "triangles_visual": len(aligned.triangles),
         "triangles_collision": len(collision.triangles),
-        "ghost_triangles_removed": n_ghost,
+        "ghost_triangles_removed": room.n_ghost,
         "extent_m": np.round(bbox.get_extent(), 3).tolist(),
         "transform_capture_to_gazebo": T.tolist(),
-        "seconds": round(time.time() - t0, 1),
+        "seconds": round(time.time() - room.t0, 1),
         "outputs": {k: str(v) for k, v in files.items()},
         "config": asdict(cfg),
     }
     (out_dir / "report.json").write_text(json.dumps(report, indent=2, default=str))
     log.info("done in %.1fs -> %s", report["seconds"], out_dir)
     return report
+
+
+def run(session_dir: str | Path, out_dir: str | Path, cfg: PipelineConfig) -> dict:
+    """`cleanscan process`: session -> clean mesh, Gazebo world, nav map (unchanged output)."""
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    return export_room(reconstruct_room(session_dir, cfg), out_dir, cfg)

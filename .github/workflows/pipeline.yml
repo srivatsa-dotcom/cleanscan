@@ -1,0 +1,92 @@
+# Desktop pipeline + LiDAR rig tests (incl. the synthetic kitchen end to end: synth-kitchen ->
+# process-rl -> validate), and the depth-module firmware: host tests, ESP32-S3 build, and on
+# main the firmware binaries in the "latest" release.
+name: Pipeline, rig and firmware
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: System libraries for Open3D
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libgomp1
+
+      - name: Install
+        run: |
+          pip install -e "./pipeline[dev,collision]" -e "./rig[dev]"
+          python -c "import open3d, mujoco, pxr; print('open3d', open3d.__version__, 'mujoco', mujoco.__version__)"
+
+      - name: Rig tests
+        working-directory: rig
+        run: pytest -q -rf
+
+      - name: Pipeline tests (synthetic room + kitchen, MuJoCo + USD validation)
+        working-directory: pipeline
+        run: pytest -q -rf --durations=10
+
+  firmware:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: PlatformIO and esptool
+        run: pip install platformio esptool
+
+      - name: Protocol unit tests on the host (pio test -e native)
+        working-directory: module/firmware
+        run: pio test -e native
+
+      - name: Build ESP32-S3 firmware
+        working-directory: module/firmware
+        run: |
+          pio run -e esp32s3
+          pio run -e xiao_esp32s3
+          B=.pio/build/esp32s3
+          # one image for `esptool.py write_flash 0x0` (bootloader + partitions + app)
+          python -m esptool --chip esp32s3 merge_bin -o cleanscan-depth-esp32s3-factory.bin \
+            0x0 $B/bootloader.bin 0x8000 $B/partitions.bin 0x10000 $B/firmware.bin
+          cp $B/firmware.bin cleanscan-depth-esp32s3.bin
+          cp .pio/build/xiao_esp32s3/firmware.bin cleanscan-depth-xiao-esp32s3.bin
+          ls -la *.bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cleanscan-depth-firmware
+          path: module/firmware/cleanscan-depth-*.bin
+
+      - name: Publish to the "latest" release
+        if: github.ref == 'refs/heads/main'
+        uses: ./.github/actions/publish-latest
+        with:
+          files: >-
+            module/firmware/cleanscan-depth-esp32s3-factory.bin
+            module/firmware/cleanscan-depth-esp32s3.bin
+            module/firmware/cleanscan-depth-xiao-esp32s3.bin
+          token: ${{ github.token }}

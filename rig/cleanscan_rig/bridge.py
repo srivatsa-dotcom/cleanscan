@@ -3,6 +3,8 @@
     cleanscan-rig --sensor ld06                 # LD06 / LD19 on /dev/serial0
     cleanscan-rig --sensor tfluna               # TF-Luna / TFmini on /dev/serial0
     cleanscan-rig --sensor sim                  # no hardware, synthetic scan
+    cleanscan-rig --sensor arducam_tof          # depth module: Arducam ToF (CSD1 depth frames)
+    cleanscan-rig --sensor simdepth             # depth module without hardware
 """
 
 from __future__ import annotations
@@ -57,10 +59,12 @@ class SimReader(threading.Thread):
 
 
 class Bridge(asyncio.DatagramProtocol):
-    def __init__(self, sensor: str, kind: str) -> None:
+    def __init__(self, sensor: str, kind: str, info: dict | None = None) -> None:
         self.sensor, self.kind = sensor, kind
+        self.info = info or {}
         self.clients: dict[tuple, float] = {}
         self.pending: list[Reading] = []
+        self.frames: list = []  # depth frames (depth-module sensors)
         self.lock = threading.Lock()
         self.transport = None
         self.sent = 0
@@ -69,6 +73,10 @@ class Bridge(asyncio.DatagramProtocol):
     def add(self, readings: list[Reading]) -> None:
         with self.lock:
             self.pending.extend(readings)
+
+    def add_frame(self, frame) -> None:
+        with self.lock:
+            self.frames = (self.frames + [frame])[-3:]  # never queue up stale frames
 
     # -- UDP
     def connection_made(self, transport) -> None:
@@ -84,7 +92,7 @@ class Bridge(asyncio.DatagramProtocol):
                 log.info("app connected: %s:%d", *addr[:2])
             self.clients[addr] = time.monotonic()
             self.transport.sendto(protocol.encode_json(
-                {"op": "info", "sensor": self.sensor, "kind": self.kind, "version": 1}), addr)
+                {"op": "info", "sensor": self.sensor, "kind": self.kind, "version": 1, **self.info}), addr)
         elif op == "ping":
             self.clients[addr] = time.monotonic()
             self.transport.sendto(protocol.encode_json(
@@ -96,6 +104,7 @@ class Bridge(asyncio.DatagramProtocol):
             await asyncio.sleep(period)
             with self.lock:
                 batch, self.pending = self.pending, []
+                frames, self.frames = self.frames, []
             now = time.monotonic()
             for addr, seen in list(self.clients.items()):
                 if now - seen > CLIENT_TIMEOUT:
@@ -106,8 +115,14 @@ class Bridge(asyncio.DatagramProtocol):
                     for addr in self.clients:
                         self.transport.sendto(pkt, addr)
                 self.sent += len(batch)
+            for f in frames if self.clients else []:
+                for pkt in protocol.encode_depth_frame(f.frame_id, f.t, f.width, f.height, f.mm):
+                    for addr in self.clients:
+                        self.transport.sendto(pkt, addr)
+                self.sent += 1
             if now - last_log > 10:
-                log.info("%d app(s), %.0f points/s", len(self.clients), self.sent / (now - last_log))
+                log.info("%d app(s), %.0f %s/s", len(self.clients), self.sent / (now - last_log),
+                         "frames" if self.kind == "depth" else "points")
                 self.sent, last_log = 0, now
 
 
@@ -118,8 +133,18 @@ async def serve(sensor: str, serial_port: str, udp_port: int) -> None:
     def sink(readings):
         holder["bridge"].add(readings)
 
-    reader = SimReader(sink) if sensor == "sim" else SerialReader(serial_port, sensor, sink)
-    bridge = Bridge(sensor, reader.kind)
+    info = {}
+    if sensor in ("arducam_tof", "simdepth"):
+        from .depth import DepthReader
+
+        reader = DepthReader(sensor, lambda f: holder["bridge"].add_frame(f))
+        src = reader.source
+        info = {"fov_deg": list(src.fov_deg)}
+        if getattr(src, "width", None):
+            info.update(width=src.width, height=src.height)
+    else:
+        reader = SimReader(sink) if sensor == "sim" else SerialReader(serial_port, sensor, sink)
+    bridge = Bridge(sensor, reader.kind, info)
     holder["bridge"] = bridge
     await loop.create_datagram_endpoint(lambda: bridge, local_addr=("0.0.0.0", udp_port))
     reader.start()
@@ -130,7 +155,8 @@ async def serve(sensor: str, serial_port: str, udp_port: int) -> None:
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(prog="cleanscan-rig", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sensor", default="ld06", help="ld06, ld19, tfluna, tfmini or sim")
+    ap.add_argument("--sensor", default="ld06",
+                    help="ld06, ld19, tfluna, tfmini, sim; depth module: arducam_tof, simdepth")
     ap.add_argument("--serial", default="/dev/serial0", help="UART device")
     ap.add_argument("--port", type=int, default=protocol.PORT, help="UDP port")
     a = ap.parse_args(argv)

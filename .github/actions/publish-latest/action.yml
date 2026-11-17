@@ -1,0 +1,36 @@
+# Uploads files to the rolling "latest" release (created if missing) and moves its tag to
+# this commit. Used by the iOS, Android and pipeline workflows on pushes to main.
+name: Publish to the "latest" release
+description: Upload build outputs to the rolling "latest" pre-release
+inputs:
+  files:
+    description: space-separated files to upload
+    required: true
+  token:
+    description: GitHub token with contents:write
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        FILES: ${{ inputs.files }}
+      run: |
+        set -euo pipefail
+        R="$GITHUB_REPOSITORY"
+        NOTES="Latest build of ${GITHUB_SHA::7} from main.
+
+        * iPhone: CleanScan-unsigned.ipa - sign and install it with Sideloadly (Windows/macOS) or the Linux Sideloader CLI, see the README.
+        * Android: CleanScan.apk - allow installing unknown apps and open it.
+        * Depth module: cleanscan-depth-esp32s3-factory.bin - esptool.py --chip esp32s3 write_flash 0x0 cleanscan-depth-esp32s3-factory.bin
+        * Desktop pipeline: pip install ./pipeline (from this commit's source)."
+        # three workflows publish here; whoever comes first creates the release
+        for i in 1 2 3 4; do
+          gh api "repos/$R/releases/tags/latest" >/dev/null 2>&1 && break
+          gh release create latest -R "$R" --prerelease --target "$GITHUB_SHA" \
+            --title "CleanScan - latest build" --notes "$NOTES" && break || sleep $((i * 5))
+        done
+        gh api -X PATCH "repos/$R/git/refs/tags/latest" -f sha="$GITHUB_SHA" -F force=true >/dev/null || true
+        gh release edit latest -R "$R" --notes "$NOTES" >/dev/null || true
+        gh release upload latest $FILES -R "$R" --clobber

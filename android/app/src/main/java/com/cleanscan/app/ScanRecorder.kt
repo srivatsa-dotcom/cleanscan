@@ -25,7 +25,18 @@ class ScanRecorder(
     private val segmenter: LivingSegmenter,
     private val onFrameWritten: (count: Int, maskedFraction: Float, mask: Bitmap?) -> Unit,
     private val onError: (String) -> Unit,
+    /** Room pass: track objects, write instances/ + thumbs/, keep keyframes for tap-to-add. */
+    val tracker: ObjectTracker? = null,
+    /** Guided capture: write object_mask/ for the detection of this COCO class nearest the image
+     * centre (-1 = any class, null = no object masks). */
+    private val captureClass: Int? = null,
+    /** Only frames whose row-major camera-to-world pose passes this test are recorded. */
+    private val gate: ((FloatArray) -> Boolean)? = null,
 ) {
+    /** A downscaled, upright copy of some room-pass frames, for adding objects by tapping. */
+    class Keyframe(val index: Int, val bitmap: Bitmap)
+
+    val keyframes = java.util.Collections.synchronizedList(ArrayList<Keyframe>())
     private val worker = Executors.newSingleThreadExecutor()
     private val busy = AtomicBoolean(false)
     private var lastPose: FloatArray? = null
@@ -39,6 +50,11 @@ class ScanRecorder(
         if (t - lastTimeNs < MIN_INTERVAL_NS) return
 
         val pose = FloatArray(16).also { camera.pose.toMatrix(it, 0) }  // column-major
+        gate?.let { g ->
+            val rowMajor = FloatArray(16)
+            for (r in 0 until 4) for (c in 0 until 4) rowMajor[r * 4 + c] = pose[c * 4 + r]
+            if (!g(rowMajor)) return
+        }
         lastPose?.let { last ->
             if (t - lastTimeNs < MAX_INTERVAL_NS && !movedEnough(last, pose)) return
         }
@@ -54,8 +70,33 @@ class ScanRecorder(
         worker.execute {
             try {
                 val bmp = BitmapFactory.decodeByteArray(captured.jpeg, 0, captured.jpeg.size)
-                val mask = segmenter.segment(bmp, captured.depthW, captured.depthH)
-                writer.write(captured, mask)
+                val dw = captured.depthW
+                val dh = captured.depthH
+                val analysis = segmenter.analyze(bmp, dw, dh, detectObjects = tracker != null || captureClass != null)
+                val mask = analysis.livingMask
+                var instances: ShortArray? = null
+                tracker?.let { tr ->
+                    val dets = analysis.objects
+                    val ids = tr.update(count, captured.timestamp, IntArray(dets.size) { dets[it].classId },
+                        FloatArray(dets.size) { dets[it].score }, dets.map { Box(it.x0, it.y0, it.x1, it.y1) })
+                    instances = instanceLabels(dets, ids, dw, dh)
+                    for (k in dets.indices) {
+                        val t = tr.tracks[ids[k]] ?: continue
+                        if (t.bestFrame == count) writer.writeFile("thumbs/${t.id}.jpg", thumbnail(bmp, dets[k]))
+                    }
+                    if (count % KEYFRAME_EVERY == 0 && keyframes.size < MAX_KEYFRAMES) {
+                        keyframes.add(Keyframe(count, upright(bmp, 480)))
+                    }
+                }
+                var objectMask: ByteArray? = null
+                captureClass?.let { cls ->
+                    val target = analysis.objects.filter { cls < 0 || it.classId == cls }
+                        .minByOrNull { (it.x0 + it.x1 - 1f).let { d -> d * d } + (it.y0 + it.y1 - 1f).let { d -> d * d } }
+                    objectMask = ByteArray(dw * dh).also { m ->
+                        if (target != null) YoloSegDecoder.rasterize(listOf(target), dw, dh, m)
+                    }
+                }
+                writer.write(captured, mask, instances, objectMask)
                 count++
                 val masked = mask.count { it != 0.toByte() }.toFloat() / mask.size
                 onFrameWritten(count, masked, maskPreview(mask, captured.depthW, captured.depthH))
@@ -140,7 +181,31 @@ class ScanRecorder(
         return Bitmap.createBitmap(bmp, 0, 0, w, h, m, false)
     }
 
+    /** Crop of a detection (portrait box) from the landscape sensor image, upright, as JPEG. */
+    private fun thumbnail(sensor: Bitmap, d: YoloSegDecoder.Detection): ByteArray {
+        // portrait (xp, yp) -> landscape (xl = yp, yl = 1 - xp)
+        val w = sensor.width
+        val h = sensor.height
+        val pad = 0.03f
+        val l = ((d.y0 - pad) * w).toInt().coerceIn(0, w - 1)
+        val r = ((d.y1 + pad) * w).toInt().coerceIn(l + 1, w)
+        val t = ((1f - d.x1 - pad) * h).toInt().coerceIn(0, h - 1)
+        val b = ((1f - d.x0 + pad) * h).toInt().coerceIn(t + 1, h)
+        val crop = Bitmap.createBitmap(sensor, l, t, r - l, b - t, android.graphics.Matrix().apply { postRotate(90f) }, true)
+        val out = ByteArrayOutputStream()
+        crop.compress(Bitmap.CompressFormat.JPEG, 85, out)
+        return out.toByteArray()
+    }
+
+    private fun upright(sensor: Bitmap, height: Int): Bitmap {
+        val scale = height.toFloat() / sensor.width  // after rotation the sensor width is the height
+        val m = android.graphics.Matrix().apply { postRotate(90f); postScale(scale, scale) }
+        return Bitmap.createBitmap(sensor, 0, 0, sensor.width, sensor.height, m, true)
+    }
+
     companion object {
+        private const val KEYFRAME_EVERY = 10
+        private const val MAX_KEYFRAMES = 24
         private const val MIN_INTERVAL_NS = 200_000_000L  // <= 5 fps
         private const val MAX_INTERVAL_NS = 500_000_000L  // keep recording while standing still
         private const val MIN_TRANSLATION = 0.01f

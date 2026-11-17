@@ -10,7 +10,7 @@ one format):
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -37,6 +37,12 @@ class Frame:
     K_depth: np.ndarray
     depth_size: tuple[int, int]  # (w, h)
     pose_gl: np.ndarray  # camera -> world, OpenGL camera axes
+    extra: dict = field(default_factory=dict)  # optional per-frame files, e.g. instances, object_mask
+    root: Path | None = None
+
+    def extra_path(self, key: str) -> Path | None:
+        rel = self.extra.get(key)
+        return self.root / rel if rel and self.root is not None else None
 
     @property
     def pose_cv(self) -> np.ndarray:
@@ -48,6 +54,9 @@ class Frame:
         """world -> camera (OpenCV axes), what Open3D integration expects."""
         return np.linalg.inv(self.pose_cv)
 
+
+# optional per-frame files added for RL scenes (docs/RL_SCENES_PLAN.md §2)
+_EXTRA_KEYS = ("instances", "object_mask")
 
 # High-rate ARKit/ARCore poses (every camera frame, ~60 Hz): f64 time + row-major 4x4 (f32)
 POSE_DTYPE = np.dtype([("t", "<f8"), ("m", "<f4", (16,))])
@@ -61,6 +70,9 @@ class Session:
         self.meta = meta
         self.frames = frames
         self.depth_unit = float(meta.get("depth_unit", 0.001))
+        # 1-sigma depth noise model (abs m, relative) of whatever depth the frames point at;
+        # set by stereo / the depth module when they produce the depth
+        self.depth_noise: tuple[float, float] = (0.002, 0.004)
         self.confidence_levels = int(meta.get("confidence_levels", 3))
         self.poses: tuple[np.ndarray, np.ndarray] | None = None  # (t, camera_to_world GL)
         self.lidar: np.ndarray | None = None  # LIDAR_DTYPE records
@@ -123,6 +135,8 @@ class Session:
                         K_depth=intrinsics_matrix(*f["depth_intrinsics"]),
                         depth_size=tuple(f["depth_size"]),
                         pose_gl=np.array(f["camera_to_world"], dtype=np.float64).reshape(4, 4),
+                        extra={k: f[k] for k in _EXTRA_KEYS if f.get(k)},
+                        root=root,
                     )
                 )
         if not frames:
@@ -167,3 +181,17 @@ class Session:
         if (m.shape[1], m.shape[0]) != tuple(size):
             m = cv2.resize(m, tuple(size), interpolation=cv2.INTER_NEAREST)
         return m > 127
+
+
+def load_label_image(path: Path | None, size: tuple[int, int] | None = None) -> np.ndarray | None:
+    """16-bit instance labels or 8-bit mask, nearest-neighbour resized to ``size`` (w, h)."""
+    if path is None or not path.exists():
+        return None
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return None
+    if img.ndim == 3:
+        img = img[..., 0]
+    if size is not None and (img.shape[1], img.shape[0]) != tuple(size):
+        img = cv2.resize(img, tuple(size), interpolation=cv2.INTER_NEAREST)
+    return img

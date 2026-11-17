@@ -20,6 +20,9 @@ struct ContentView: View {
                         if scan.rigEnabled {
                             RigStatusView(rig: scan.rig, host: scan.rigHost)
                         }
+                        if scan.depthModuleEnabled {
+                            DepthModuleStatusView(module: scan.depthModule)
+                        }
                         if !scan.hasSegmentationModel {
                             Text("Animal model not bundled - using built-in cat/dog detector")
                                 .font(.caption2).foregroundStyle(.yellow)
@@ -43,12 +46,16 @@ struct ContentView: View {
 
                 Spacer()
 
+                if scan.phase == .capturing {
+                    GuideOverlay(scan: scan)
+                }
+
                 HStack(spacing: 28) {
                     Button { showLibrary = true } label: {
                         Image(systemName: "folder").font(.title2).frame(width: 56, height: 56)
                             .background(.ultraThinMaterial, in: Circle())
                     }
-                    .disabled(scan.isRecording)
+                    .disabled(scan.isRecording || scan.phase != .idle)
 
                     Button(action: scan.toggleRecording) {
                         ZStack {
@@ -70,6 +77,9 @@ struct ContentView: View {
             .foregroundStyle(.white)
         }
         .sheet(isPresented: $showLibrary) { LibraryView(scan: scan) }
+        .sheet(isPresented: Binding(get: { scan.phase == .selecting }, set: { _ in })) {
+            ObjectSelectionView(scan: scan)
+        }
     }
 }
 
@@ -83,6 +93,23 @@ struct ARViewContainer: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: ARView, context: Context) {}
+}
+
+/// One line on the scan screen: is the depth module streaming?
+struct DepthModuleStatusView: View {
+    @ObservedObject var module: DepthModuleClient
+
+    var body: some View {
+        if module.connected {
+            Text("Depth module: \(module.sensor.uppercased()) · \(module.framesPerSecond) fps"
+                 + (module.rttMs.map { String(format: " · sync %.0f ms", $0) } ?? ""))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(module.framesPerSecond > 0 ? .green : .yellow)
+        } else {
+            Text("Depth module: looking for it - join the CleanScanDepth Wi-Fi")
+                .font(.caption).foregroundStyle(.yellow)
+        }
+    }
 }
 
 /// One line on the scan screen: is the LiDAR rig streaming?
@@ -123,6 +150,18 @@ struct LibraryView: View {
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                         RigStatusView(rig: scan.rig, host: scan.rigHost)
+                    }
+                }
+                Section(header: Text("External depth module"),
+                        footer: Text("Clip-on ToF camera for phones without LiDAR (see module/README.md). " +
+                                     "Join the CleanScanDepth Wi-Fi; the module is found automatically.")) {
+                    Toggle("Use depth module", isOn: $scan.depthModuleEnabled)
+                    if scan.depthModuleEnabled {
+                        TextField("Module address (optional)", text: $scan.depthModuleHost)
+                            .keyboardType(.numbersAndPunctuation)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        DepthModuleStatusView(module: scan.depthModule)
                     }
                 }
                 Section(footer: Text("Export a scan and process it on your computer:\n" +

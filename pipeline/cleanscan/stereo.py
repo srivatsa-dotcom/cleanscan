@@ -166,5 +166,6 @@ def estimate_session_depth(session: Session, cfg: StereoConfig | None = None) ->
         if (i + 1) % 50 == 0 or i + 1 == n:
             log.info("stereo depth %d/%d frames", i + 1, n)
     session.depth_unit = 0.001
+    session.depth_noise = (0.005, 0.01)
     if coverage:
         log.info("stereo depth: %.0f%% of pixels have depth on average", 100 * np.mean(coverage))

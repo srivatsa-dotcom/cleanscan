@@ -85,14 +85,69 @@ def _bilinear(img: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
             + im[y0 + 1, x0] * (1 - fx) * fy + im[y0 + 1, x0 + 1] * fx * fy)
 
 
+def _uvatlas_child(conn, V, F, size):
+    t = o3d.t.geometry.TriangleMesh()
+    t.vertex.positions = o3d.core.Tensor(V.astype(np.float32))
+    t.triangle.indices = o3d.core.Tensor(F.astype(np.int64))
+    t.compute_uvatlas(size=size, gutter=2.0, parallel_partitions=max(1, os.cpu_count() or 1))
+    conn.send(t.triangle.texture_uvs.numpy().astype(np.float64))
+    conn.close()
+
+
+def grid_atlas(n_triangles: int, size: int) -> np.ndarray:
+    """Fallback atlas: every pair of triangles gets its own small square cell."""
+    g = int(np.ceil(np.sqrt(max(n_triangles, 1) / 2)))
+    cell = 1.0 / g
+    pad = min(1.5 / size, 0.15 * cell)
+    k = np.arange(n_triangles)
+    c = k // 2
+    x0, y0 = (c % g) * cell, (c // g) * cell
+    a, b = x0 + pad, y0 + pad
+    e = cell - 3 * pad
+    first = (k % 2) == 0
+    uv = np.empty((n_triangles, 3, 2))
+    uv[first] = np.stack([np.stack([a, b], -1), np.stack([a + e, b], -1), np.stack([a, b + e], -1)], 1)[first]
+    a2, b2 = a + 2 * pad, b + 2 * pad
+    uv[~first] = np.stack([np.stack([a2 + e, b2], -1), np.stack([a2 + e, b2 + e], -1),
+                           np.stack([a2, b2 + e], -1)], 1)[~first]
+    return np.clip(uv, 0, 1)
+
+
+def safe_uv_atlas(mesh: o3d.geometry.TriangleMesh, size: int) -> np.ndarray:
+    """Open3D's UVAtlas, in a child process: on some meshes it crashes the whole process
+    (native segfault). Then a simple grid atlas is used instead (lower texture quality)."""
+    import multiprocessing as mp
+
+    V, F = np.asarray(mesh.vertices), np.asarray(mesh.triangles)
+    try:
+        ctx = mp.get_context("fork")
+    except ValueError:  # no fork (Windows): run in-process as before
+        t = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+        t.compute_uvatlas(size=size, gutter=2.0, parallel_partitions=max(1, os.cpu_count() or 1))
+        return t.triangle.texture_uvs.numpy().astype(np.float64)
+    parent, child = ctx.Pipe(duplex=False)
+    p = ctx.Process(target=_uvatlas_child, args=(child, V, F, size))
+    p.start()
+    child.close()
+    uvs = None
+    try:
+        if parent.poll(1800):
+            uvs = parent.recv()
+    except EOFError:
+        uvs = None
+    p.join(5)
+    if uvs is None or len(uvs) != len(F):
+        log.warning("UV atlas failed (exit code %s); using a simple grid atlas", p.exitcode)
+        return grid_atlas(len(F), size)
+    return uvs
+
+
 def bake_texture(session: Session, mesh: o3d.geometry.TriangleMesh, cfg: TextureConfig,
                  dynamic_masks: dict[int, np.ndarray] | None = None) -> TexturedMesh:
     """``mesh`` must be in the capture's world frame (the frame the poses use)."""
     mesh.compute_triangle_normals()
-    tmesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
     log.info("computing UV atlas for %d triangles", len(mesh.triangles))
-    tmesh.compute_uvatlas(size=cfg.size, gutter=2.0, parallel_partitions=max(1, os.cpu_count() or 1))
-    uvs = tmesh.triangle.texture_uvs.numpy().astype(np.float64)  # (T,3,2), row 0 = v 0
+    uvs = safe_uv_atlas(mesh, cfg.size)  # (T,3,2), row 0 = v 0
 
     V = np.asarray(mesh.vertices)
     F = np.asarray(mesh.triangles)

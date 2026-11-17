@@ -28,7 +28,9 @@ class SessionWriter private constructor(val dir: File) {
     private val frames = FileWriter(File(dir, "frames.jsonl"), true)
     private var index = 0
 
-    fun write(f: CapturedFrame, mask: ByteArray) {
+    /** @param instances 16-bit object labels (track ids) at depth resolution, room pass only
+     *  @param objectMask 0/255 mask of the object being captured (guided captures) */
+    fun write(f: CapturedFrame, mask: ByteArray, instances: ShortArray? = null, objectMask: ByteArray? = null) {
         val name = "%06d".format(index)
         File(dir, "color/$name.jpg").writeBytes(f.jpeg)
         PngWriter.writeGray16(File(dir, "depth/$name.png"), f.depthW, f.depthH, f.depthMM)
@@ -48,18 +50,43 @@ class SessionWriter private constructor(val dir: File) {
             PngWriter.writeGray8(File(dir, "confidence/$name.png"), f.depthW, f.depthH, it)
             rec.put("confidence", "confidence/$name.png")
         }
+        instances?.let {
+            File(dir, "instances").mkdirs()
+            PngWriter.writeGray16(File(dir, "instances/$name.png"), f.depthW, f.depthH, it)
+            rec.put("instances", "instances/$name.png")
+        }
+        objectMask?.let {
+            File(dir, "object_mask").mkdirs()
+            PngWriter.writeGray8(File(dir, "object_mask/$name.png"), f.depthW, f.depthH, it)
+            rec.put("object_mask", "object_mask/$name.png")
+        }
         frames.write(rec.toString() + "\n")
         index++
     }
 
+    val frameCount get() = index
+
     fun finish() = frames.close()
+
+    /** Write a small file next to the session (tracks.json, selection.json, thumbs/...). */
+    fun writeFile(relative: String, bytes: ByteArray) {
+        val f = File(dir, relative)
+        f.parentFile?.mkdirs()
+        f.writeBytes(bytes)
+    }
 
     companion object {
         fun scansDir(context: Context) = File(context.getExternalFilesDir(null), "Scans")
 
         fun create(context: Context): SessionWriter {
             val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-            val dir = File(scansDir(context), "Scan-$stamp")
+            return createIn(File(scansDir(context), "Scan-$stamp"), extensions = listOf("objects"))
+        }
+
+        /** A guided object capture inside a scan: Scan-.../captures/<id>/<stage>/ (a full session). */
+        fun createCapture(scanDir: File, relative: String): SessionWriter = createIn(File(scanDir, relative))
+
+        private fun createIn(dir: File, extensions: List<String> = emptyList()): SessionWriter {
             for (sub in listOf("color", "depth", "confidence", "mask")) File(dir, sub).mkdirs()
             File(dir, "session.json").writeText(
                 JSONObject()
@@ -73,6 +100,7 @@ class SessionWriter private constructor(val dir: File) {
                     .put("recommended_min_confidence", 0.3)
                     .put("world_up", "y")
                     .put("camera_convention", "opengl")
+                    .put("extensions", JSONArray(extensions))
                     .toString(2)
             )
             return SessionWriter(dir)

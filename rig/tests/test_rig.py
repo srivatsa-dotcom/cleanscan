@@ -85,3 +85,84 @@ def test_bridge_and_monitor_end_to_end():
     assert r["rtt_ms"] < 50
     assert 2.4 < r["median_range_m"] < 4.0  # inside the simulated 6 x 5 m room
     assert r["latency_ms"] < 100
+
+
+def test_depth_frame_roundtrip_out_of_order_and_lost_chunks():
+    import random
+
+    w, h = 100, 100
+    frame = [(x * 7 + y * 13) % 4000 for y in range(h) for x in range(w)]
+    pk = protocol.encode_depth_frame(42, 123.456, w, h, frame)
+    assert len(pk) == 15 and all(len(p) <= 1400 for p in pk)  # 20 kB in MTU-sized packets
+    asm = protocol.DepthAssembler()
+    random.Random(0).shuffle(pk)
+    out = [r for p in pk if (r := asm.feed(p))]
+    assert len(out) == 1
+    fid, t, ww, hh, px = out[0]
+    assert (fid, t, ww, hh) == (42, 123.456, w, h) and px == frame
+    # a frame missing one chunk is dropped once a newer frame completes
+    lost = protocol.encode_depth_frame(43, 124.0, w, h, frame)[:-1]
+    for p in lost:
+        assert asm.feed(p) is None
+    newer = [asm.feed(p) for p in protocol.encode_depth_frame(44, 124.1, w, h, frame)]
+    assert newer[-1][0] == 44 and asm.dropped == 1
+
+
+def test_depth_module_bridge_streams_frames_with_clock_sync():
+    """simdepth sensor -> bridge -> UDP -> app-side assembler, like the phone apps do."""
+    import socket
+
+    from cleanscan_rig import bridge
+
+    port = 56124  # the LiDAR bridge test above keeps 56123 open
+    th = threading.Thread(target=lambda: asyncio.run(bridge.serve("simdepth", "", port)), daemon=True)
+    th.start()
+    time.sleep(0.5)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(0.5)
+    s.sendto(protocol.encode_json({"op": "hello"}), ("127.0.0.1", port))
+    asm = protocol.DepthAssembler()
+    info, frame, deadline = None, None, time.time() + 10
+    s.sendto(protocol.encode_json({"op": "ping", "id": 1, "t1": time.monotonic()}), ("127.0.0.1", port))
+    pong = None
+    while time.time() < deadline and (frame is None or info is None or pong is None):
+        try:
+            data, _ = s.recvfrom(2048)
+        except socket.timeout:
+            s.sendto(protocol.encode_json({"op": "hello"}), ("127.0.0.1", port))
+            continue
+        msg = protocol.decode_json(data)
+        if msg and msg["op"] == "info":
+            info = msg
+        elif msg and msg["op"] == "pong":
+            pong = msg
+        elif data.startswith(protocol.DEPTH_MAGIC):
+            frame = asm.feed(data) or frame
+    assert info["kind"] == "depth" and info["sensor"] == "simdepth" and info["width"] == 100
+    assert pong is not None
+    fid, t, w, h, mm = frame
+    assert (w, h) == (100, 100) and sum(1 for v in mm if v) > 5000  # walls within the 2.5 m range
+
+
+def test_firmware_packets_decode_in_python(tmp_path):
+    """The ESP32 firmware's C++ encoder (module/firmware) and the Python decoder agree."""
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    import pytest
+
+    cxx = shutil.which("g++") or shutil.which("clang++")
+    if cxx is None:
+        pytest.skip("no C++ compiler")
+    fw = Path(__file__).resolve().parents[2] / "module" / "firmware"
+    exe = tmp_path / "csd1_dump"
+    subprocess.run([cxx, "-std=c++17", "-O1", f"-I{fw / 'lib/cleanscan_proto/src'}",
+                    str(fw / "test/host/csd1_dump.cpp"), str(fw / "lib/cleanscan_proto/src/cleanscan_proto.cpp"),
+                    "-o", str(exe)], check=True)
+    n = int(subprocess.run([str(exe), str(tmp_path)], check=True, capture_output=True, text=True).stdout)
+    asm = protocol.DepthAssembler()
+    out = [r for k in range(n) if (r := asm.feed((tmp_path / f"pkt{k}.bin").read_bytes()))]
+    fid, t, w, h, mm = out[0]
+    assert (fid, t, w, h) == (4242, 1000.125, 100, 100)
+    assert mm == [(i * 37) % 2600 for i in range(10000)]

@@ -42,8 +42,15 @@ final class LivingBeingMasker {
 
     var hasModel: Bool { model != nil }
 
+    /// Core ML model name: Info.plist key CleanScanSegModel (project.yml), default "LivingSeg".
+    /// Any YOLO-seg export (nms=False) with COCO class order works; see LICENSES.md for why
+    /// you may want to replace the bundled AGPL-3.0 YOLO11 model.
+    static var modelName: String {
+        Bundle.main.object(forInfoDictionaryKey: "CleanScanSegModel") as? String ?? "LivingSeg"
+    }
+
     init() {
-        if let url = Bundle.main.url(forResource: "LivingSeg", withExtension: "mlmodelc"),
+        if let url = Bundle.main.url(forResource: Self.modelName, withExtension: "mlmodelc"),
            let ml = try? MLModel(contentsOf: url, configuration: MLModelConfiguration()) {
             model = try? VNCoreMLModel(for: ml)
         } else {
@@ -52,13 +59,50 @@ final class LivingBeingMasker {
     }
 
     func mask(for f: CapturedFrame) -> LivingMask {
+        analyze(f, detectObjects: false).mask
+    }
+
+    /// The living-being mask, plus (with ``detectObjects``) the other COCO objects the same
+    /// YOLO pass found - portrait-normalised boxes and masks - for object selection.
+    func analyze(_ f: CapturedFrame, detectObjects: Bool) -> (mask: LivingMask, objects: [YOLOSegDecoder.Detection]) {
         let (w, h) = f.depthSize
         var out = LivingMask(width: w, height: h, pixels: [UInt8](repeating: 0, count: w * h))
         if let seg = f.personSegmentation { addARKitPeople(seg, into: &out) }
+        var objects: [YOLOSegDecoder.Detection] = []
         if let model {
-            addYOLO(model: model, image: f.image, into: &out)
+            objects = addYOLO(model: model, image: f.image, into: &out, detectObjects: detectObjects)
         } else {
             addVisionAnimals(image: f.image, into: &out)
+        }
+        return (out, objects)
+    }
+
+    /// Detections -> 16-bit labels (track ids) over the landscape depth-resolution image.
+    static func instanceLabels(_ dets: [YOLOSegDecoder.Detection], ids: [Int], width: Int, height: Int) -> [UInt16] {
+        var out = [UInt16](repeating: 0, count: width * height)
+        guard !dets.isEmpty else { return out }
+        for y in 0..<height {
+            let xp = 1 - (Float(y) + 0.5) / Float(height)
+            for x in 0..<width {
+                let yp = (Float(x) + 0.5) / Float(width)
+                for (k, d) in dets.enumerated() where ids[k] > 0 && d.contains(xp: xp, yp: yp) {
+                    out[y * width + x] = UInt16(clamping: ids[k])
+                    break
+                }
+            }
+        }
+        return out
+    }
+
+    /// One detection -> 0/255 mask over the landscape depth-resolution image.
+    static func objectMask(_ d: YOLOSegDecoder.Detection?, width: Int, height: Int) -> [UInt8] {
+        var out = [UInt8](repeating: 0, count: width * height)
+        guard let d else { return out }
+        for y in 0..<height {
+            let xp = 1 - (Float(y) + 0.5) / Float(height)
+            for x in 0..<width where d.contains(xp: xp, yp: (Float(x) + 0.5) / Float(width)) {
+                out[y * width + x] = 255
+            }
         }
         return out
     }
@@ -86,17 +130,20 @@ final class LivingBeingMasker {
     /// The camera buffer is landscape; the phone is held in portrait, so the image is
     /// given to Vision rotated (.right) - detectors work much better on upright people.
     /// Portrait-normalised (xp, yp) <-> landscape-normalised (xl, yl): xl = yp, yl = 1 - xp.
-    private func addYOLO(model: VNCoreMLModel, image: CVPixelBuffer, into m: inout LivingMask) {
+    @discardableResult
+    private func addYOLO(model: VNCoreMLModel, image: CVPixelBuffer, into m: inout LivingMask,
+                         detectObjects: Bool = false) -> [YOLOSegDecoder.Detection] {
         let request = VNCoreMLRequest(model: model)
         request.imageCropAndScaleOption = .scaleFill
         let handler = VNImageRequestHandler(cvPixelBuffer: image, orientation: .right)
         guard (try? handler.perform([request])) != nil,
-              let obs = request.results as? [VNCoreMLFeatureValueObservation] else { return }
+              let obs = request.results as? [VNCoreMLFeatureValueObservation] else { return [] }
         let arrays = obs.compactMap { $0.featureValue.multiArrayValue }
         guard let det = arrays.first(where: { $0.shape.count == 3 }),
-              let proto = arrays.first(where: { $0.shape.count == 4 }) else { return }
-        let detections = YOLOSegDecoder.decode(det: det, proto: proto, classes: Self.livingClasses,
-                                               confidence: confidence)
+              let proto = arrays.first(where: { $0.shape.count == 4 }) else { return [] }
+        let classes = detectObjects ? Self.livingClasses.union(objectClasses) : Self.livingClasses
+        let all = YOLOSegDecoder.decode(det: det, proto: proto, classes: classes, confidence: confidence)
+        let detections = all.filter { Self.livingClasses.contains($0.classId) }
         for d in detections {
             for y in 0..<m.height {
                 let xp = 1 - (Float(y) + 0.5) / Float(m.height)
@@ -106,6 +153,7 @@ final class LivingBeingMasker {
                 }
             }
         }
+        return all.filter { !Self.livingClasses.contains($0.classId) }
     }
 
     // MARK: 3. Fallback: Vision animal boxes

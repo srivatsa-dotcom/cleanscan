@@ -5,7 +5,9 @@ name: iOS app
 
 on:
   push:
-    branches: [main]
+    branches: [main, "feature/**"]
+    paths: ["ios/**", ".github/workflows/ios.yml"]
+  pull_request:
     paths: ["ios/**", ".github/workflows/ios.yml"]
   workflow_dispatch:
 
@@ -13,7 +15,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: ios-ipa
+  group: ios-ipa-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -39,6 +41,8 @@ jobs:
           test -d build/Release-iphoneos/CleanScan.app
 
       - name: Package .ipa and publish release "ios-latest"
+        # branches and pull requests only build; releases come from main
+        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

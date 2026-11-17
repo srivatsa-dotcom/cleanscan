@@ -15,6 +15,12 @@ Scan-20261022-101500/
   lidar.bin           # optional: external LiDAR rig readings (rig/README.md)
   rig.json            # optional: rig sensor description, written when lidar.bin exists
   planes.json         # optional: ARKit plane anchors at the end of the scan
+  instances/000000.png  # optional (RL scenes): 16-bit object labels, value = track id, 0 = none
+  tracks.json         # optional (RL scenes): objects the phone's detector tracked
+  thumbs/<id>.jpg     # optional (RL scenes): best crop of each tracked object
+  selection.json      # optional (RL scenes): objects the user made interactive
+  captures/<id>/<stage>/  # optional (RL scenes): one guided capture = a complete session
+                          # (+ object_mask/000000.png: 255 = the object, depth resolution)
 ```
 
 `depth/` and `confidence/` are absent for camera-only captures (phones without LiDAR/ToF);
@@ -63,3 +69,30 @@ be given as `"extrinsic"` (16 numbers, row-major, LiDAR -> OpenGL camera) in `ri
 `planes.json`: list of `{"transform": 16 numbers row-major, "center": [x,y,z],
 "extent": [x, 0, z], "alignment": "horizontal"|"vertical"}`; the plane lies in its local
 x-z plane, normal = local +y (ARKit convention).
+
+## RL-scene additions (optional, backwards compatible)
+
+Written by the apps' object selection and guided capture (docs/RL_SCENES_PLAN.md); old
+pipelines ignore them, `cleanscan process-rl` uses them. `session.json` may list
+`"extensions": ["objects"]`; `frames.jsonl` records may have `instances` / `object_mask` paths.
+
+`tracks.json`: `[{"id", "class", "coco_id", "score", "frames", "first_frame", "best_frame", "thumb"}]`.
+
+`selection.json`:
+
+```json
+{"objects": [
+  {"id": 2, "class": "bottle", "name": "bottle", "mode": "pickable", "source": "detected",
+   "captures": {"scan": "captures/2/scan"}},
+  {"id": 101, "class": "cupboard", "name": "Cupboard", "mode": "articulated", "source": "tap",
+   "captures": {"closed": "captures/101/closed", "open": "captures/101/open"},
+   "seed": {"frame": 57, "u": 0.41, "v": 0.63}}
+]}
+```
+
+`mode`: `pickable` (stage `scan`), `articulated` (`closed`, `open`) or `transparent`
+(`profile`, `top`). `seed`: the tap that added an object the detector missed: room-pass frame
+index and position in 0..1 of the sensor (landscape) image; the pipeline turns it into a 3D
+point with that frame's depth. An object whose `captures` is empty was skipped and stays part
+of the static room. Guided captures run in the same AR session as the room pass, so all poses
+share one world frame.

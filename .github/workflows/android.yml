@@ -6,15 +6,17 @@ name: Android APK
 
 on:
   push:
-    branches: [main]
-    paths: ["android/**", ".github/workflows/android.yml"]
+    branches: [main, "feature/**"]
+    paths: ["android/**", "tools/app-logic-test/**", ".github/workflows/android.yml"]
+  pull_request:
+    paths: ["android/**", "tools/app-logic-test/**", ".github/workflows/android.yml"]
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: android-apk
+  group: android-apk-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -34,6 +36,13 @@ jobs:
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" 2>&1 | tail -5 | tee sdk.log
 
+      - name: JVM checks of the app's object-capture logic (tools/app-logic-test)
+        run: |
+          kotlinc -version
+          tools/app-logic-test/run.sh /tmp/fixture 2>&1 | tee app-logic.log
+          # the pipeline's tests read this fixture: it must match what the app writes
+          diff -r /tmp/fixture pipeline/tests/data/app_fixture
+
       - name: Build debug APK
         working-directory: android
         run: |
@@ -42,6 +51,8 @@ jobs:
           exit ${PIPESTATUS[0]}
 
       - name: Publish APK as release "android-latest"
+        # branches and pull requests only build; releases come from main
+        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -55,7 +66,7 @@ jobs:
       - name: Save build log to the ci-logs branch
         if: failure()
         run: |
-          cat sdk.log build.log > /tmp/build.log 2>/dev/null || echo "failed before the Gradle build (see the Actions run)" > /tmp/build.log
+          cat app-logic.log sdk.log build.log > /tmp/build.log 2>/dev/null || echo "failed before the Gradle build (see the Actions run)" > /tmp/build.log
           git config user.name "ci"
           git config user.email "ci@users.noreply.github.com"
           git checkout --orphan ci-logs

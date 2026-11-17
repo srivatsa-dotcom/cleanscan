@@ -1,0 +1,54 @@
+# Builds the depth-module firmware (module/firmware, ESP32-S3 + MaixSense A010) and runs its
+# protocol unit tests on the host. Branches and pull requests only build; the binary is
+# attached to the run as an artifact.
+name: Depth module firmware
+
+on:
+  push:
+    branches: [main, "feature/**"]
+    paths: ["module/**", ".github/workflows/firmware.yml"]
+  pull_request:
+    paths: ["module/**", ".github/workflows/firmware.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: firmware-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: PlatformIO
+        run: pip install platformio
+
+      - name: Protocol unit tests on the host (pio test -e native)
+        working-directory: module/firmware
+        run: pio test -e native
+
+      - name: Build ESP32-S3 firmware
+        working-directory: module/firmware
+        run: |
+          pio run -e esp32s3
+          pio run -e xiao_esp32s3
+          B=.pio/build/esp32s3
+          # one image for `esptool.py write_flash 0x0` (bootloader + partitions + app)
+          pip install esptool
+          python -m esptool --chip esp32s3 merge_bin -o cleanscan-depth-esp32s3-factory.bin \
+            0x0 $B/bootloader.bin 0x8000 $B/partitions.bin 0x10000 $B/firmware.bin
+          cp $B/firmware.bin cleanscan-depth-esp32s3.bin
+          ls -la *.bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cleanscan-depth-firmware
+          path: module/firmware/cleanscan-depth-esp32s3*.bin

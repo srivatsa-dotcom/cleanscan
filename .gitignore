@@ -13,3 +13,6 @@ tools/decoder-test/build/
 tools/decoder-test/.gradle/
 .kotlin/
 MUJOCO_LOG.TXT
+.pio/
+module/firmware/sdkconfig.*
+!module/firmware/sdkconfig.defaults

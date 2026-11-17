@@ -124,7 +124,7 @@ class DepthModuleClient(context: Context) {
     }
 }
 
-/** Writes module frames next to a session: tof/*.png (16-bit mm), tof.jsonl, depth_module.json. */
+/** Writes module frames next to a session: tof/NNNNNN.png (16-bit mm), tof.jsonl, depth_module.json. */
 class DepthRecorder(private val dir: File) {
     private val worker = Executors.newSingleThreadExecutor()
     private val lines = FileWriter(File(dir, "tof.jsonl").also { File(dir, "tof").mkdirs() }, true)

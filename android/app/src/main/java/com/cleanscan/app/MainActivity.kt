@@ -39,6 +39,8 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private val background = BackgroundRenderer()
     private lateinit var segmenter: LivingSegmenter
     @Volatile private var recorder: ScanRecorder? = null
+    private var roomWriter: SessionWriter? = null
+    private lateinit var flow: GuidedCaptureFlow
     private var displayRotation = 0
     private var viewW = 0
     private var viewH = 0
@@ -62,8 +64,10 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             status.text = "Warning: ${LivingSegmenter.MODEL} missing - people/animals will NOT be masked " +
                 "on the phone (desktop --resegment and ghost removal still work)"
         }
-        recordButton.setOnClickListener { toggleRecording() }
-        findViewById<Button>(R.id.scans).setOnClickListener { showScans() }
+        val scansButton = findViewById<Button>(R.id.scans)
+        flow = GuidedCaptureFlow(this, segmenter, status, recordButton) { scansButton.isEnabled = true }
+        recordButton.setOnClickListener { if (flow.active) flow.toggle() else toggleRecording() }
+        scansButton.setOnClickListener { showScans() }
     }
 
     override fun onResume() {
@@ -121,6 +125,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     override fun onPause() {
         super.onPause()
         if (recorder != null) toggleRecording()
+        if (flow.active && flow.recorder != null) flow.toggle()
         surface.onPause()
         session?.pause()
     }
@@ -145,6 +150,8 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         val current = recorder
         if (current == null) {
             val writer = SessionWriter.create(this)
+            roomWriter = writer
+            // object detection + tracking needs the YOLO model; without it objects are added by tapping
             recorder = ScanRecorder(writer, segmenter,
                 onFrameWritten = { n, masked, mask ->
                     runOnUiThread {
@@ -152,7 +159,8 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                         maskPreview.setImageBitmap(mask)
                     }
                 },
-                onError = { msg -> runOnUiThread { status.text = msg } })
+                onError = { msg -> runOnUiThread { status.text = msg } },
+                tracker = ObjectTracker())
             recordButton.text = "Stop"
             maskPreview.visibility = View.VISIBLE
             status.text = "Recording - move slowly, cover every wall and the floor"
@@ -160,7 +168,14 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             recorder = null
             recordButton.text = "Record"
             maskPreview.visibility = View.GONE
-            current.finish { runOnUiThread { status.text = "Saved. Tap Scans to export." } }
+            val dir = roomWriter?.dir
+            findViewById<Button>(R.id.scans).isEnabled = false
+            current.finish {
+                runOnUiThread {
+                    status.text = "Saved the room. Choose interactive objects."
+                    if (dir != null) flow.start(dir, current.tracker!!, current.keyframes.toList())
+                }
+            }
         }
     }
 
@@ -217,5 +232,6 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         val frame = try { s.update() } catch (e: Exception) { return }
         background.draw(frame)
         recorder?.onFrame(frame)
+        flow.onFrame(frame, viewW, viewH)
     }
 }

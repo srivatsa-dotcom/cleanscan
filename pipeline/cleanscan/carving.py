@@ -21,6 +21,7 @@ class View:
     E: np.ndarray  # 4x4 world -> camera (OpenCV axes)
     depth: np.ndarray  # (h, w) metres, 0 = no data
     mask: np.ndarray | None = None  # (h, w) bool foreground, or None
+    noise: tuple = (0.0, 0.0)  # 1-sigma depth noise (abs m, relative)
 
 
 def session_views(session, frames=None, motion: np.ndarray | None = None, depth_fn=None, mask_fn=None,
@@ -33,7 +34,8 @@ def session_views(session, frames=None, motion: np.ndarray | None = None, depth_
             continue
         d = session.load_depth(fr) if depth_fn is None else depth_fn(fr)
         E = fr.extrinsic_cv if motion is None else fr.extrinsic_cv @ motion
-        out.append(View(fr.K_depth, E, d, None if mask_fn is None else mask_fn(fr, d)))
+        out.append(View(fr.K_depth, E, d, None if mask_fn is None else mask_fn(fr, d),
+                        getattr(session, "depth_noise", (0.0, 0.0))))
     return out
 
 
@@ -47,8 +49,12 @@ def grid_centers(lo, hi, voxel) -> tuple[np.ndarray, tuple]:
 
 def carve(views: list[View], lo, hi, voxel: float, grid_to_world: np.ndarray | None = None,
           depth_tol: float = 0.012, min_free_votes: int = 2, mask_dilate_px: int = 1,
-          require_seen: bool = True) -> np.ndarray:
-    """Occupancy (bool grid, shape from ``grid_centers``) of the box [lo, hi] in the grid frame."""
+          require_seen: bool = True, noise_sigmas: float = 2.0, min_free_frac: float = 0.0) -> np.ndarray:
+    """Occupancy (bool grid, shape from ``grid_centers``) of the box [lo, hi] in the grid frame.
+
+    The see-through tolerance is ``depth_tol`` or ``noise_sigmas`` x the view's depth noise
+    at that distance, whichever is larger; a voxel is empty when at least ``min_free_votes``
+    and ``min_free_frac`` of the views that see it say so (noisy depth makes single views lie)."""
     C, shape = grid_centers(lo, hi, voxel)
     Cw = C if grid_to_world is None else C @ grid_to_world[:3, :3].T + grid_to_world[:3, 3]
     free = np.zeros(len(C), np.int32)
@@ -68,12 +74,13 @@ def carve(views: list[View], lo, hi, voxel: float, grid_to_world: np.ndarray | N
             continue
         d = v.depth[r[idx], u[idx]]
         seen[idx] += 1
-        empty = (d > 0) & (z[idx] < d - depth_tol)
+        tol = np.maximum(depth_tol, noise_sigmas * (v.noise[0] + v.noise[1] * z[idx]))
+        empty = (d > 0) & (z[idx] < d - tol)
         if v.mask is not None:
             m = binary_dilation(v.mask, iterations=mask_dilate_px) if mask_dilate_px else v.mask
-            empty |= ~m[r[idx], u[idx]] & ((d == 0) | (z[idx] < d + depth_tol))
+            empty |= ~m[r[idx], u[idx]] & ((d == 0) | (z[idx] < d + tol))
         free[idx[empty]] += 1
-    occ = free < min_free_votes
+    occ = (free < min_free_votes) | (free < min_free_frac * seen)
     if require_seen:
         occ &= seen > 0
     return occ.reshape(shape)

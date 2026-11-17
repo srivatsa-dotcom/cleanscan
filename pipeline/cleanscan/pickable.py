@@ -45,6 +45,7 @@ class PickableConfig:
     max_triangles: int = 6000
     texture_size: int = 512
     use_app_masks: bool = True  # object masks written by the app, when present
+    noisy_free_frac: float = 0.2  # noisy depth (module, stereo): share of views that must agree
 
 
 @dataclass
@@ -154,8 +155,10 @@ def reconstruct_pickable(session: Session, cfg: PickableConfig | None = None, te
     hi = np.array([centre[0] + radius + margin, support + height + margin, centre[1] + radius + margin])
     mask_fn = (lambda fr, d: _object_mask(fr, fr.depth_size)) if has_masks else None
     views = carving.session_views(session, mask_fn=mask_fn)
+    noisy = getattr(session, "depth_noise", (0, 0))[1] >= 0.005
     occ = carving.carve(views, lo, hi, cfg.voxel, depth_tol=cfg.depth_tol,
-                        min_free_votes=cfg.min_free_votes, mask_dilate_px=cfg.mask_dilate_px)
+                        min_free_votes=cfg.min_free_votes, mask_dilate_px=cfg.mask_dilate_px,
+                        min_free_frac=cfg.noisy_free_frac if noisy else 0.0)
     occ[:, 0, :] = occ[:, 1, :]  # the bottom layer touches the support
     if not occ.any():
         raise RuntimeError("space carving removed everything; check the capture")

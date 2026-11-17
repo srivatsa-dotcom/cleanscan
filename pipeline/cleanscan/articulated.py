@@ -46,6 +46,7 @@ class ArticulatedConfig:
     part_pixel_dist: float = 0.025  # a pixel shows the part if within this of its points
     revolute_min_deg: float = 5.0
     max_room_views: int = 40
+    part_free_frac: float = 0.4  # carving: share of the views that must see a voxel empty
     part_floor_clearance: float = 0.01  # m; moving parts (doors) must not touch the floor
     snap_deg: float = 4.0  # snap joint axes this close to the object's main directions
     drawer_back_gap: float = 0.03  # inferred drawer depth stops this short of the body's back
@@ -140,8 +141,9 @@ def seen_through(points: np.ndarray, views: list[carving.View], tol: float, wind
         idx = np.nonzero(ok)[0]
         d = v.depth[r[idx], u[idx]]
         dm = dmin[r[idx], u[idx]]
-        through[idx[(dm > 0) & (dm > z[idx] + tol)]] += 1
-        agree[idx[(d > 0) & (np.abs(d - z[idx]) < tol)]] += 1
+        t = np.maximum(tol, 2.5 * (v.noise[0] + v.noise[1] * z[idx]))  # noisier sensors need more
+        through[idx[(dm > 0) & (dm > z[idx] + t)]] += 1
+        agree[idx[(d > 0) & (np.abs(d - z[idx]) < t)]] += 1
     return np.where(through >= min_frac * (through + agree), through, 0)
 
 
@@ -204,8 +206,48 @@ def _motion_prismatic(axis, dist) -> np.ndarray:
     return M
 
 
+def panel_extent(Pc: np.ndarray, closed_points: np.ndarray, plane_tol: float = 0.02,
+                 step: float = 0.03) -> np.ndarray:
+    """The whole moving panel in the closed scan: the changed points grown across all
+    closed-scan points in the same plane. Points next to a hinge hardly move, so change
+    detection alone stops short of the hinge; the panel's surface itself goes all the way."""
+    c = Pc.mean(0)
+    _, e = np.linalg.eigh(np.cov((Pc - c).T))
+    n = e[:, 0]
+    S = closed_points[np.abs((closed_points - c) @ n) < plane_tol]
+    if not len(S):
+        return Pc
+    tree = cKDTree(S)
+    grown = np.zeros(len(S), bool)
+    frontier = np.unique(np.concatenate([i for i in tree.query_ball_point(Pc, step) if i] or [np.zeros(0, int)]))
+    grown[frontier] = True
+    while len(frontier):
+        nb = tree.query_ball_point(S[frontier], step)
+        new = np.unique(np.concatenate([np.asarray(i, int) for i in nb])) if nb is not None else np.zeros(0, int)
+        new = new[~grown[new]]
+        grown[new] = True
+        frontier = new
+    return np.concatenate([Pc, S[grown]])
+
+
+def panel_edges(G: np.ndarray, plane_ref: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
+    """The four edge lines (point, direction) of a panel, in the plane of ``plane_ref``."""
+    c = plane_ref.mean(0)
+    _, e = np.linalg.eigh(np.cov((plane_ref - c).T))
+    n = e[:, 0]
+    _, eg = np.linalg.eigh(np.cov((G - G.mean(0)).T))
+    u = eg[:, 2] - (eg[:, 2] @ n) * n
+    u /= np.linalg.norm(u)
+    v = np.cross(n, u)
+    a, b = (G - c) @ u, (G - c) @ v
+    a0, a1 = np.percentile(a, [0.5, 99.5])
+    b0, b1 = np.percentile(b, [0.5, 99.5])
+    return [(c + a0 * u, v), (c + a1 * u, v), (c + b0 * v, u), (c + b1 * v, u)]
+
+
 def fit_joint(Pc: np.ndarray, Po: np.ndarray, cfg: ArticulatedConfig, rng=None,
-              Nc: np.ndarray | None = None, No: np.ndarray | None = None) -> JointFit:
+              Nc: np.ndarray | None = None, No: np.ndarray | None = None,
+              panel: np.ndarray | None = None) -> JointFit:
     rng = rng or np.random.default_rng(0)
     pick = rng.choice(len(Pc), min(len(Pc), 800), replace=False)
     sub = Pc[pick]
@@ -224,7 +266,8 @@ def fit_joint(Pc: np.ndarray, Po: np.ndarray, cfg: ArticulatedConfig, rng=None,
     c = Pc.mean(0)
     w, e = np.linalg.eigh(np.cov((Pc - c).T))
     n, v, u = e[:, 0], e[:, 1], e[:, 2]
-    a, b = (Pc - c) @ u, (Pc - c) @ v
+    ext = Pc if panel is None else panel  # the panel's full extent, when known
+    a, b = (ext - c) @ u, (ext - c) @ v
     a0, a1 = np.percentile(a, [1, 99])
     b0, b1 = np.percentile(b, [1, 99])
     # hinge lines along the panel's edges. Points right next to a hinge hardly move, so the
@@ -279,11 +322,15 @@ def fit_joint(Pc: np.ndarray, Po: np.ndarray, cfg: ArticulatedConfig, rng=None,
 
 
 def refine_with_axis(fit: JointFit, Pc: np.ndarray, Po: np.ndarray, axis: np.ndarray,
-                     Nc: np.ndarray | None = None, No: np.ndarray | None = None) -> JointFit:
+                     Nc: np.ndarray | None = None, No: np.ndarray | None = None,
+                     edges: list | None = None, edge_weight: float = 0.3) -> JointFit:
     """Re-fit the joint with a fixed axis direction by minimising the same robust,
     normal-aware distance as the hypothesis search: hinge position (2 dof) + opening angle,
     or the slide distance. A fine local grid, then Powell. (Nearest-point least squares
-    slides along the door's own surface when parts of it were not observed.)"""
+    slides along the door's own surface when parts of it were not observed.)
+
+    ``edges``: the panel's edge lines; hinges sit on one, so a hinge more than 1 cm from the
+    nearest parallel edge is penalised (noisy depth leaves a shallow valley along the door)."""
     from scipy.optimize import minimize
 
     axis = axis / np.linalg.norm(axis)
@@ -298,6 +345,14 @@ def refine_with_axis(fit: JointFit, Pc: np.ndarray, Po: np.ndarray, axis: np.nda
 
     pick_o = rng.choice(len(Po), min(len(Po), 1500), replace=False)
     sub_o, nsub_o = Po[pick_o], None if No is None else No[pick_o]
+
+    par = [(q, d) for q, d in (edges or []) if abs(d @ axis) > 0.9]
+
+    def edge_penalty(p):
+        if not par:
+            return 0.0
+        dmin = min(float(np.linalg.norm(np.cross(p - q, d))) for q, d in par)
+        return edge_weight * max(0.0, dmin - 0.01)
 
     def dist(M):
         q = sub @ M[:3, :3].T + M[:3, 3]
@@ -323,17 +378,20 @@ def refine_with_axis(fit: JointFit, Pc: np.ndarray, Po: np.ndarray, axis: np.nda
 
         def motion(x):
             return _motion_revolute(axis, p0 + x[0] * e1 + x[1] * e2, x[2])
-        best = (dist(motion([0, 0, ang0])), np.array([0.0, 0.0, ang0]))
+
+        def objective(x):
+            return dist(motion(x)) + edge_penalty(p0 + x[0] * e1 + x[1] * e2)
+        best = (objective([0, 0, ang0]), np.array([0.0, 0.0, ang0]))
         for da in np.radians(np.arange(-4, 4.1, 2.0)):
             for x0 in np.arange(-0.075, 0.076, 0.015):
                 for x1 in np.arange(-0.075, 0.076, 0.015):
                     x = np.array([x0, x1, ang0 + da])
-                    sc = dist(motion(x))
+                    sc = objective(x)
                     if sc < best[0]:
                         best = (sc, x)
-        x = minimize(lambda xx: dist(motion(xx)), best[1], method="Powell",
+        x = minimize(objective, best[1], method="Powell",
                      options={"xtol": 1e-4, "ftol": 1e-6, "maxfev": 400}).x
-        if dist(motion(x)) > best[0]:
+        if objective(x) > best[0]:
             x = best[1]
         origin, value = p0 + x[0] * e1 + x[1] * e2, float(x[2])
     else:
@@ -459,7 +517,8 @@ def reconstruct_articulated(closed: Session, opened: Session, room: Session | No
         raise RuntimeError(f"no moving part found (changed points: closed {len(Pc)}, open {len(Po)}); "
                            "was it opened fully between the two captures?")
     Nc, No = oriented_normals(Pc, Cc), oriented_normals(Po, Co)
-    fit = fit_joint(Pc, Po, cfg, Nc=Nc, No=No)
+    panel = panel_extent(Pc, Pcl)
+    fit = fit_joint(Pc, Po, cfg, Nc=Nc, No=No, panel=panel)
     M, Minv = fit.M, np.linalg.inv(fit.M)
     log.info("joint: %s, opening %.3f %s, fit %.1f mm", fit.type, fit.value,
              "rad" if fit.type == "revolute" else "m", fit.score * 1000)
@@ -473,7 +532,8 @@ def reconstruct_articulated(closed: Session, opened: Session, room: Session | No
     k = int(np.argmax(cos))
     off = float(np.degrees(np.arccos(min(cos[k], 1.0))))
     snapped = off < cfg.snap_deg
-    fit = refine_with_axis(fit, Pc, Po, dirs[k] if snapped else fit.axis, Nc, No)
+    fit = refine_with_axis(fit, Pc, Po, dirs[k] if snapped else fit.axis, Nc, No,
+                           edges=panel_edges(panel, Pc) if fit.type == "revolute" else None)
     fit.info["axis_snapped_deg"] = round(off, 2) if snapped else None
     M, Minv = fit.M, np.linalg.inv(fit.M)
     log.info("joint axis %s; opening %.3f, two-way fit score %.1f mm",
@@ -516,9 +576,11 @@ def reconstruct_articulated(closed: Session, opened: Session, room: Session | No
     lo_p[2] = max(lo_p[2], floor_o + cfg.part_floor_clearance)  # a moving part clears the floor
     drawer_info = None
     occ_c = carving.carve(carving.session_views(closed, mask_fn=pmask_closed), lo_p, hi_p, cfg.part_voxel,
-                          grid_to_world=A, depth_tol=0.015, require_seen=False)
+                          grid_to_world=A, depth_tol=0.015, require_seen=False,
+                          min_free_frac=cfg.part_free_frac)
     occ_o = carving.carve(carving.session_views(opened, motion=M, mask_fn=pmask_open), lo_p, hi_p,
-                          cfg.part_voxel, grid_to_world=A, depth_tol=0.03, require_seen=False)
+                          cfg.part_voxel, grid_to_world=A, depth_tol=0.03, require_seen=False,
+                          min_free_frac=cfg.part_free_frac)
     occ_p = occ_c & occ_o
     occ_p = _keep_touching(occ_p, Qo, lo_p, cfg.part_voxel)
     if fit.type == "prismatic":
@@ -544,7 +606,8 @@ def reconstruct_articulated(closed: Session, opened: Session, room: Session | No
         body_center = _to(A, ((lo_b + hi_b) / 2)[None])[0]
         frames = _relevant_frames(room, body_center, cfg.max_room_views)
         views_body += carving.session_views(room, frames, depth_fn=zero_part(tree_closed, room))
-    occ_b = carving.carve(views_body, lo_b, hi_b, cfg.body_voxel, grid_to_world=A, depth_tol=0.02)
+    occ_b = carving.carve(views_body, lo_b, hi_b, cfg.body_voxel, grid_to_world=A, depth_tol=0.02,
+                          min_free_frac=0.2)
     # the part's own volume (closed) is not body
     Cb, _ = carving.grid_centers(lo_b, hi_b, cfg.body_voxel)
     in_part = np.zeros(len(Cb), bool)

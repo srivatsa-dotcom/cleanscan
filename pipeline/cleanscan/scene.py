@@ -349,8 +349,33 @@ def room_collision_boxes(mesh_zup: o3d.geometry.TriangleMesh, voxel: float = 0.0
                         bmax[2] = near[np.argmin(np.abs(near - bmax[2]))]
                 boxes.append({"center": _round((bmin + bmax) / 2, 5), "size": _round(bmax - bmin, 5)})
                 i = i1 + 1
+    boxes = drop_floor_noise(boxes)
     log.info("room collision: %d boxes (voxel %.0f mm)", len(boxes), voxel * 1000)
     return boxes
+
+
+def drop_floor_noise(boxes: list[dict], max_top: float = 0.08, max_area: float = 0.04) -> list[dict]:
+    """Small, low boxes standing alone on the floor are depth noise (the floor itself is an
+    infinite plane in every exporter); they would block doors sweeping over the floor.
+    A box is kept when anything else stands on top of it (furniture feet, walls)."""
+    keep = []
+    for i, b in enumerate(boxes):
+        c, sz = np.asarray(b["center"]), np.asarray(b["size"])
+        top = c[2] + sz[2] / 2
+        if top < max_top and sz[0] * sz[1] < max_area:
+            lo, hi = c[:2] - sz[:2] / 2, c[:2] + sz[:2] / 2
+            above = any(
+                (np.asarray(o["center"])[2] - np.asarray(o["size"])[2] / 2) <= top + 1e-3
+                and np.asarray(o["center"])[2] > c[2]
+                and np.all(np.asarray(o["center"])[:2] + np.asarray(o["size"])[:2] / 2 > lo)
+                and np.all(np.asarray(o["center"])[:2] - np.asarray(o["size"])[:2] / 2 < hi)
+                for j, o in enumerate(boxes) if j != i)
+            if not above:
+                continue
+        keep.append(b)
+    if len(keep) < len(boxes):
+        log.info("dropped %d low floor-noise boxes", len(boxes) - len(keep))
+    return keep
 
 
 def object_world_points(o: SceneObject, scene_dir: Path) -> np.ndarray:

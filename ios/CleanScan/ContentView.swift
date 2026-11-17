@@ -43,12 +43,16 @@ struct ContentView: View {
 
                 Spacer()
 
+                if scan.phase == .capturing {
+                    GuideOverlay(scan: scan)
+                }
+
                 HStack(spacing: 28) {
                     Button { showLibrary = true } label: {
                         Image(systemName: "folder").font(.title2).frame(width: 56, height: 56)
                             .background(.ultraThinMaterial, in: Circle())
                     }
-                    .disabled(scan.isRecording)
+                    .disabled(scan.isRecording || scan.phase != .idle)
 
                     Button(action: scan.toggleRecording) {
                         ZStack {
@@ -70,6 +74,9 @@ struct ContentView: View {
             .foregroundStyle(.white)
         }
         .sheet(isPresented: $showLibrary) { LibraryView(scan: scan) }
+        .sheet(isPresented: Binding(get: { scan.phase == .selecting }, set: { _ in })) {
+            ObjectSelectionView(scan: scan)
+        }
     }
 }
 

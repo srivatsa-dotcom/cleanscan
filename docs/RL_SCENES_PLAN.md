@@ -1,6 +1,7 @@
 # CleanScan RL: scan a room → RL-ready simulation scene
 
-Status: **plan, waiting for review**. Nothing below is implemented yet.
+Status: **implemented** on `feature/rl-scenes` (milestones 1-8). Where the implementation
+differs from this plan, see §14 at the end.
 
 This plan extends CleanScan without removing anything. `cleanscan process` keeps
 producing exactly what it does today. Everything new is additive: new files in the
@@ -412,3 +413,27 @@ and keeps the sensor-depth variant as a second, faster test.
 * **Doors opened less than about 30°** make axis estimation weak, so the app asks the user to
   open them fully. Below a 10° opening, the pipeline falls back to the class prior (hinge at
   the nearest vertical edge) and warns.
+
+## 14. What changed during implementation
+
+* **Support patches** under every pickable: the room pass rarely sees the surface under an
+  object, so a thin static box at the measured support height is added in all exporters.
+* **Room carving** removes room triangles within max(2 cm, 1.5 voxels) of each object and drops
+  room collision boxes that still reach into an object or are isolated floor-noise lumps.
+* **Space carving** (`carving.py`) instead of TSDF + plane removal for pickables and
+  articulated links: it gives closed solids by construction. Its tolerance follows each depth
+  source's noise model (sensor, stereo, depth module).
+* **Articulated joints:** change detection by see-through votes with a min-depth window;
+  normal-consistent matching (normals face the camera that saw each point); axes snapped to the
+  object's main directions within 4°; hinge refinement keeps the hinge near an edge of the
+  panel grown across its plane. Links of one object never collide with each other in MJCF.
+  Hidden drawer depth is inferred (reported as a warning).
+* **Masses:** checked for pickables and moving links; a welded body's mass has no effect in
+  simulation and its hidden inner panels cannot be seen.
+* **Depth module calibration** starts from the clip's nominal mounting and is held softly near
+  it (a circular walk is otherwise ambiguous), and uses the room pass plus all object captures.
+  Upsampling uses a 2-px edge-aware window (measured against ground-truth depth).
+* **Apps:** the segmentation model is chosen by configuration (LICENSES.md); the guided-capture
+  flow lives in the scan screen because the AR session must keep running.
+* **Not implemented:** the optional desktop open-vocabulary refiners (OWLv2 / Grounding DINO +
+  SAM 2). The UV atlas runs in a child process because Open3D can crash on some meshes.

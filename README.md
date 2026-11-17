@@ -20,6 +20,71 @@ moments of the scan. The result is exported as a ready-to-run **Gazebo world** p
 
 ![Synthetic test: a person walks in front of the wall; the exported mesh has the wall rebuilt behind them](docs/demo_before_after.png)
 
+## Install in 5 minutes
+
+Everything below comes from the rolling
+[**latest** release](https://github.com/srivatsa-dotcom/cleanscan/releases/tag/latest), rebuilt by
+GitHub Actions on every push to `main`.
+
+| | |
+|---|---|
+| **iPhone** (iOS 16+, iPhone 11 or newer) | Download [CleanScan-unsigned.ipa](https://github.com/srivatsa-dotcom/cleanscan/releases/download/latest/CleanScan-unsigned.ipa), install it with [Sideloadly](https://sideloadly.io) and your Apple ID (Windows/macOS) or the Linux Sideloader CLI - steps in [iPhone app](#3-iphone-app). |
+| **Android** (ARCore phone, Android 8+) | Download [CleanScan.apk](https://github.com/srivatsa-dotcom/cleanscan/releases/download/latest/CleanScan.apk) on the phone, allow "install unknown apps", open it. |
+| **Desktop pipeline** (Python 3.10-3.13; Linux, macOS, Windows) | `git clone https://github.com/srivatsa-dotcom/cleanscan && pip install "./cleanscan/pipeline[sim,collision]"` (on Linux also `sudo apt install libegl1 libgl1`). `sim` adds MuJoCo + USD checks, `collision` better collision shapes. |
+| **Depth module** (optional, for phones without LiDAR) | Build it from [module/README.md](module/README.md), then flash with one command: `cd module/firmware && pio run -t upload`, or download [cleanscan-depth-esp32s3-factory.bin](https://github.com/srivatsa-dotcom/cleanscan/releases/download/latest/cleanscan-depth-esp32s3-factory.bin) and run `esptool.py --chip esp32s3 write_flash 0x0 cleanscan-depth-esp32s3-factory.bin`. |
+
+## Scan your kitchen for RL
+
+CleanScan can turn a scan into a **simulation scene where a robot can open the fridge, pull out
+drawers and pick up bottles and glasses**: one folder that loads in **Isaac Sim / Isaac Lab
+(USD)**, **MuJoCo (MJCF)** and **Gazebo (SDF)**.
+
+![What the phone records: a room pass (with a person walking through) and guided captures of the selected objects](docs/rl_kitchen_input.jpg)
+
+1. **Room pass.** Press Record and walk slowly through the kitchen, as for any scan. The app
+   detects objects as you go (fridge, bottles, cups, ...).
+2. **Choose the interactive objects.** After Stop the app lists what it found ("Found:
+   refrigerator, 2× bottle, cup. Which should be interactive for RL?"). Tick the ones the robot
+   should use and check their type: **Pick up**, **Opens** (doors, drawers) or **Glass**. Missed
+   something (a cupboard, a pressure cooker)? *Add an object the phone missed*, tap it on a photo
+   and type its name.
+3. **Guided captures**, one per object, the app tells you what to do:
+   * *Pick up*: put it on a free surface and walk around it until the ring is full;
+   * *Opens*: scan it closed, open it fully, scan again;
+   * *Glass*: hold the phone level beside it, then one shot from the top.
+4. **Export** the scan (Scans → Export) and run on your computer:
+
+   ```bash
+   cleanscan process-rl Scan-XXXX.zip -o my_kitchen     # ~5-15 min on a laptop CPU
+   cleanscan validate my_kitchen                          # 5 s MuJoCo check, also writes report.json
+   ```
+
+![The generated scene in MuJoCo: the fridge door and the drawer move on fitted joints, the bottle is a free rigid body](docs/rl_kitchen_actions.gif)
+
+```
+my_kitchen/
+  scene.json        # objects: type, pose, mass, inertia, friction, joints (m, kg, Z up, floor z = 0)
+  room/             # the static room: meshes, Gazebo model, Nav2 map, collision boxes
+  objects/<id>/     # visual.obj + texture, collision/*.obj (convex pieces)
+  export/scene.usda # Isaac Sim / Isaac Lab (UsdPhysics) + isaaclab_scene.py example config
+  export/scene.xml  # MuJoCo
+  export/world.sdf  # Gazebo Sim (world.world: Classic) + run_gazebo.sh
+  report.json       # what was found, quality metrics, warnings, validation results
+my_kitchen.zip
+```
+
+* **Change physics** (mass, friction, material, joint limits, object type) in `scene.json`
+  under each object's `"overrides"`, then `cleanscan export my_kitchen`. Default masses come
+  from `pipeline/cleanscan/data/materials.yaml` (class → material → density, hollow shells).
+* **Try it without a phone:**
+  `cleanscan synth-kitchen kitchen --depth-module a010 && cleanscan process-rl kitchen -o kitchen_scene`
+  (a synthetic kitchen as an iPhone 11 with the clip-on depth module records it; the images above
+  come from this run, rendered with `tools/render_readme.py`).
+* **How it works and what to expect:** [docs/RL_SCENES_PLAN.md](docs/RL_SCENES_PLAN.md). On the
+  synthetic kitchen the tests require (and get) hinge axes within 5°, hinge positions within
+  3 cm, object positions within 2 cm and masses within 30 %. Real scans will be less accurate;
+  `report.json` lists every assumption made (for example inferred drawer depth) as a warning.
+
 ## How living beings are removed
 
 Removal works in three layers, so that something missed by one layer is caught by the next:
@@ -55,8 +120,8 @@ animal are skipped, so nobody gets "painted" onto the walls.
 ```bash
 cd pipeline
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"          # add ,seg for desktop re-segmentation (ultralytics)
-pytest -q                        # 5 end-to-end tests on a synthetic room
+pip install -e ".[dev]"          # add ,seg for desktop re-segmentation (ultralytics, AGPL)
+pytest -q                        # synthetic room + kitchen end-to-end tests (~8 min)
 
 # try it without a phone: synthetic room + walking person + dog
 cleanscan synth demo_session
@@ -78,7 +143,9 @@ Ultralytics reference with an IoU of 0.94–0.98 on test photos of people and do
 
 > **License:** Ultralytics YOLO models are AGPL-3.0. Publishing an app that bundles them
 > requires AGPL compliance or an Ultralytics Enterprise license. Any YOLO-seg-style model
-> trained on COCO classes (same output layout) can be swapped in.
+> trained on COCO classes (same output layout) can be swapped in by configuration (iOS
+> `CleanScanSegModel` in `ios/project.yml`, Android `-Pcleanscan.segModel=...`); see
+> [LICENSES.md](LICENSES.md).
 
 Without the model, the iPhone app still removes people (ARKit) and cats/dogs (Apple Vision,
 box-masked), and the Android app warns that it is not masking on the phone. Ghost removal
@@ -86,11 +153,11 @@ and `--resegment` on the desktop still work in both cases.
 
 ### 3. iPhone app
 
-**Install the test build without a Mac:** GitHub builds an unsigned app on every push that
-changes `ios/` (`.github/workflows/ios.yml`). Download
-[CleanScan-unsigned.ipa](https://github.com/srivatsa-dotcom/cleanscan/releases/download/ios-latest/CleanScan-unsigned.ipa)
-from the [ios-latest release](https://github.com/srivatsa-dotcom/cleanscan/releases/tag/ios-latest),
-then sign and install it with your Apple ID:
+**Install the test build without a Mac:** GitHub builds an unsigned app on every push to `main`
+(`.github/workflows/ios.yml`). Download
+[CleanScan-unsigned.ipa](https://github.com/srivatsa-dotcom/cleanscan/releases/download/latest/CleanScan-unsigned.ipa)
+from the [latest release](https://github.com/srivatsa-dotcom/cleanscan/releases/tag/latest)
+(the older `ios-latest` release keeps being updated too), then sign and install it with your Apple ID:
 
 1. On a Windows PC or a Mac, install [Sideloadly](https://sideloadly.io) (on Windows also
    iTunes and iCloud from Apple's website, not the Microsoft Store versions).
@@ -106,7 +173,7 @@ builds it for x86_64 (`.github/workflows/sideloader.yml`):
 ```bash
 sudo apt install -y usbmuxd libimobiledevice6 libimobiledevice-utils libplist3
 wget https://github.com/srivatsa-dotcom/cleanscan/releases/download/sideloader-linux/sideloader-linux-x86_64
-wget https://github.com/srivatsa-dotcom/cleanscan/releases/download/ios-latest/CleanScan-unsigned.ipa
+wget https://github.com/srivatsa-dotcom/cleanscan/releases/download/latest/CleanScan-unsigned.ipa
 chmod +x sideloader-linux-x86_64
 idevicepair pair                      # tap Trust on the iPhone, then run it again
 ./sideloader-linux-x86_64 install -i CleanScan-unsigned.ipa
@@ -133,9 +200,13 @@ open CleanScan.xcodeproj         # set your Team under Signing, run on a LiDAR d
 ### 4. Android app
 
 **Ready-to-install test build:** download
-[CleanScan-debug.apk](https://github.com/srivatsa-dotcom/cleanscan/releases/download/android-latest/CleanScan-debug.apk)
-from the [android-latest release](https://github.com/srivatsa-dotcom/cleanscan/releases/tag/android-latest).
-GitHub Actions rebuilds it on every push that changes `android/` (`.github/workflows/android.yml`).
+[CleanScan.apk](https://github.com/srivatsa-dotcom/cleanscan/releases/download/latest/CleanScan.apk)
+from the [latest release](https://github.com/srivatsa-dotcom/cleanscan/releases/tag/latest).
+GitHub Actions rebuilds it on every push to `main` (`.github/workflows/android.yml`; the older
+`android-latest` release with `CleanScan-debug.apk` keeps being updated too). CI builds are
+debug-signed unless a release keystore is set up as repository secrets (`ANDROID_KEYSTORE_B64`,
+`ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`); with debug signing,
+uninstall the previous version before installing a newer one.
 
 To build it yourself:
 
@@ -170,6 +241,12 @@ holes. The 2D map uses the same origin, so `map` and Gazebo `world` line up.
 To spawn the scan inside your own world:
 `<include><uri>model://my_room</uri></include>` with `GZ_SIM_RESOURCE_PATH`
 (or `GAZEBO_MODEL_PATH`) pointing at `my_room/models`.
+
+## No LiDAR phone? Add a depth module
+
+The **clip-on depth module** (ESP32-S3 + MaixSense A010 ToF camera, about USD 40) streams depth
+images to the app; it is the recommended add-on for RL scenes on an iPhone 11. Hardware,
+wiring, flashing and scanning: [module/README.md](module/README.md).
 
 ## No LiDAR phone? Add one: the CleanScan rig
 
@@ -212,9 +289,11 @@ and scanning steps: [rig/README.md](rig/README.md).
 ```
 ios/        SwiftUI + ARKit + RealityKit app (XcodeGen project.yml)
 android/    Kotlin + ARCore + TFLite app (Gradle)
-pipeline/   Python package `cleanscan` + tests
+pipeline/   Python package `cleanscan` + tests (process, process-rl, validate, export, synth*)
+rig/        Raspberry Pi bridge for an external LiDAR or an Arducam ToF depth module
+module/     clip-on depth module: ESP32-S3 + A010 firmware, 3D-printable clip, parts list
 tools/      model export + Android model/decoder verification (decoder-test/)
-docs/       capture_format.md (the shared phone→desktop format)
+docs/       capture_format.md (the shared phone→desktop format), RL_SCENES_PLAN.md
 ```
 
 ## Known limitations
@@ -228,3 +307,9 @@ docs/       capture_format.md (the shared phone→desktop format)
   on the phone. Ghost removal still catches them if they move.
 * Processing runs on a computer, not on the phone. A 3-minute scan takes several minutes on a
   laptop CPU.
+
+## License
+
+Code: Apache-2.0 ([LICENSE](LICENSE)). Depth-module firmware: MIT. Depth-module hardware:
+CERN-OHL-P-2.0. Third-party licences, and what to check before distributing the apps (the
+bundled YOLO model is AGPL-3.0): [LICENSES.md](LICENSES.md).

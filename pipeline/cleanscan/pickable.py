@@ -24,9 +24,9 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import open3d as o3d
-from scipy.ndimage import binary_dilation, gaussian_filter, label as cc_label
 from scipy.spatial import cKDTree
 
+from . import carving
 from .session import Session, load_label_image
 
 log = logging.getLogger(__name__)
@@ -152,57 +152,17 @@ def reconstruct_pickable(session: Session, cfg: PickableConfig | None = None, te
     margin = 3 * cfg.voxel + 0.01
     lo = np.array([centre[0] - radius - margin, support, centre[1] - radius - margin])
     hi = np.array([centre[0] + radius + margin, support + height + margin, centre[1] + radius + margin])
-    shape = np.ceil((hi - lo) / cfg.voxel).astype(int) + 1
-    gi = [lo[k] + cfg.voxel * (np.arange(shape[k]) + 0.5) for k in range(3)]
-    X, Y, Z = np.meshgrid(*gi, indexing="ij")
-    C = np.stack([X.ravel(), Y.ravel(), Z.ravel()], 1)
-    free = np.zeros(len(C), np.int32)
-    seen = np.zeros(len(C), np.int32)
-    for fr in session.frames:
-        depth = session.load_depth(fr)
-        h, w = depth.shape
-        mask = _object_mask(fr, fr.depth_size) if has_masks else None
-        if mask is not None and cfg.mask_dilate_px:
-            mask = binary_dilation(mask, iterations=cfg.mask_dilate_px)
-        E = fr.extrinsic_cv
-        pc = C @ E[:3, :3].T + E[:3, 3]
-        z = pc[:, 2]
-        ok = z > 0.05
-        u = np.full(len(C), -1, np.int64)
-        v = np.full(len(C), -1, np.int64)
-        K = fr.K_depth
-        u[ok] = np.floor(K[0, 0] * pc[ok, 0] / z[ok] + K[0, 2]).astype(np.int64)
-        v[ok] = np.floor(K[1, 1] * pc[ok, 1] / z[ok] + K[1, 2]).astype(np.int64)
-        ok &= (u >= 0) & (u < w) & (v >= 0) & (v < h)
-        idx = np.nonzero(ok)[0]
-        d = depth[v[idx], u[idx]]
-        seen[idx] += 1
-        empty = (d > 0) & (z[idx] < d - cfg.depth_tol)
-        if mask is not None:
-            empty |= ~mask[v[idx], u[idx]] & ((d == 0) | (z[idx] < d + cfg.depth_tol))
-        free[idx[empty]] += 1
-    occ = ((free < cfg.min_free_votes) & (seen > 0)).reshape(shape)
+    mask_fn = (lambda fr, d: _object_mask(fr, fr.depth_size)) if has_masks else None
+    views = carving.session_views(session, mask_fn=mask_fn)
+    occ = carving.carve(views, lo, hi, cfg.voxel, depth_tol=cfg.depth_tol,
+                        min_free_votes=cfg.min_free_votes, mask_dilate_px=cfg.mask_dilate_px)
     occ[:, 0, :] = occ[:, 1, :]  # the bottom layer touches the support
-    lab, n = cc_label(occ)
-    if n == 0:
+    if not occ.any():
         raise RuntimeError("space carving removed everything; check the capture")
-    ci = np.clip(np.round((np.array([centre[0], support + height / 2, centre[1]]) - lo) / cfg.voxel).astype(int),
-                 0, shape - 1)
-    sizes = np.bincount(lab.ravel())
-    sizes[0] = 0
-    keep = lab[tuple(ci)] if lab[tuple(ci)] > 0 else int(np.argmax(sizes))
-    occ = lab == keep
-
-    from skimage.measure import marching_cubes
-
-    field_ = np.pad(gaussian_filter(occ.astype(np.float32), 0.8), 1)  # padding closes the solid
-    verts, faces, _, _ = marching_cubes(field_, 0.5)
-    verts = (verts - 1 + 0.5) * cfg.voxel + lo  # back to capture coordinates
-    mesh = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(verts), o3d.utility.Vector3iVector(faces[:, ::-1]))
-    mesh.remove_duplicated_vertices()
-    mesh.remove_degenerate_triangles()
-    if len(mesh.triangles) > cfg.max_triangles:
-        mesh = mesh.simplify_quadric_decimation(cfg.max_triangles)
+    ci = np.round((np.array([centre[0], support + height / 2, centre[1]]) - lo) / cfg.voxel).astype(int)
+    occ = carving.keep_component(occ, ci)
+    Vg, Fg = carving.solid_to_mesh(occ, lo, cfg.voxel, cfg.max_triangles)
+    mesh = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(Vg), o3d.utility.Vector3iVector(Fg))
     mesh.compute_vertex_normals()
     Vc = np.asarray(mesh.vertices)
     bottom = Vc[:, 1].min()
